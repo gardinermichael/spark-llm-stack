@@ -1,2 +1,7 @@
 HANDOFF.md
 .claude/settings.local.json
+upstreams/
+runs/
+work/
+secrets/
+.DS_Store

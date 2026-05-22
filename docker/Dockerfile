@@ -1,15 +1,15 @@
 # llama.cpp MTP inference server for NVIDIA DGX Spark (GB10 Grace Blackwell)
 # Exposes ports on host network; access via the host's Tailscale IP.
 #
-# Build:
-#   docker build -t spark-llm-stack .
-#   docker build --build-arg BUILD_JOBS=20 -t spark-llm-stack .
+# Build (run from repo root so tools/flux-gen is reachable):
+#   docker build -f docker/Dockerfile -t spark-llm-stack .
+#   docker build -f docker/Dockerfile --build-arg BUILD_JOBS=20 -t spark-llm-stack .
 #
 # PERFORMANCE WARNING — LLAMA_REF default:
 #   The default LLAMA_REF=master ships mainline llama.cpp, which currently
 #   underperforms on GB10 (~23 vs ~28 t/s on Qwen3.6-27B). The systemd
 #   *.service files use a pre-merge MTP branch. For full perf:
-#     docker build --build-arg LLAMA_REF=<mtp-commit-or-branch> -t spark-llm-stack .
+#     docker build -f docker/Dockerfile --build-arg LLAMA_REF=<mtp-commit-or-branch> -t spark-llm-stack .
 #   Pin to a SHA — branch HEADs drift and break reproducibility.
 
 ARG CUDA_VERSION=13.2.0
@@ -38,11 +38,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ENV LD_LIBRARY_PATH=/usr/local/cuda-13/compat:${LD_LIBRARY_PATH}
 
 WORKDIR /build
-RUN git clone --depth 1 --branch ${LLAMA_REF} ${LLAMA_REPO} llama.cpp 2>/dev/null \
- || git clone --depth 1 ${LLAMA_REPO} llama.cpp && \
-    cd llama.cpp && \
-    git fetch --depth 1 origin ${LLAMA_REF} && \
-    git checkout FETCH_HEAD 2>/dev/null || true
+# Hard-fail on bad LLAMA_REF — silent fallback to master masked perf regressions.
+# `--branch` accepts both branch names and tags. To pin a SHA, override LLAMA_REF
+# with a branch/tag that points at it, or remove `--depth 1` and `git checkout` it.
+RUN git clone --depth 1 --branch ${LLAMA_REF} ${LLAMA_REPO} llama.cpp
 
 WORKDIR /build/llama.cpp
 RUN cmake -B build -G Ninja \
@@ -74,7 +73,7 @@ COPY --from=builder /build/llama.cpp/build/bin/llama-bench   /usr/local/bin/llam
 
 # flux-gen is bundled so you can: docker exec <ctr> flux-gen "prompt"
 # It's an HTTP client; set FLUX_HOST=http://<addr>:8160 to target a remote server.
-COPY flux-gen /usr/local/bin/flux-gen
+COPY tools/flux-gen /usr/local/bin/flux-gen
 RUN chmod +x /usr/local/bin/flux-gen
 
 # CUDA driver compat shim — see builder stage for rationale.
@@ -104,7 +103,7 @@ CMD [ \
   "--port", "8152", \
   "-ngl", "999", \
   "-fa", "on", \
-  "-c", "131072", \
+  "-c", "262144", \
   "--cache-type-k", "q8_0", \
   "--cache-type-v", "q8_0", \
   "--kv-unified", \

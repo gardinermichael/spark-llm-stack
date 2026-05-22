@@ -13,7 +13,7 @@ A systemd user-service LLM inference stack for NVIDIA DGX Spark GB10 (Grace Blac
 
 ## Key architectural constraint
 
-Running multiple heavyweight services simultaneously exhausts 128 GB unified memory and causes an OOM respawn brick loop (see `POSTMORTEM.md`). `harden-llm-stack.sh` applies `Conflicts=` drop-ins to enforce mutual exclusion at the systemd level. `docker-llm-switch` enforces the same via `stop_all_except` before every `docker run`.
+Running multiple heavyweight services simultaneously exhausts 128 GB unified memory and causes an OOM respawn brick loop (see `reference-previous/POSTMORTEM.md`). `harden-llm-stack.sh` applies `Conflicts=` drop-ins to enforce mutual exclusion at the systemd level. `docker-llm-switch` enforces the same via `stop_all_except` before every `docker run`.
 
 ## How slots are defined (the mirroring pattern)
 
@@ -21,26 +21,26 @@ Each model slot (e.g. `coder`) is defined in **four parallel places** that must 
 
 | File | Role |
 |---|---|
-| `*.service` | Systemd unit; `ExecStart` is the authoritative arg set |
-| `llm-switch` | `SVCS[]`, `PORTS[]`, `ROLES[]` maps + wait logic |
-| `docker-llm-switch` | `CMD_<slot>` array mirrors `ExecStart` with `--host 0.0.0.0` |
-| `harden-llm-stack.sh` | `SERVICES=()` array with `MemoryHigh/Max` and heavyweight flag |
+| `systemd/units/*.service` | Systemd unit; `ExecStart` is the authoritative arg set |
+| `systemd/llm-switch` | `SVCS[]`, `PORTS[]`, `ROLES[]` maps + wait logic |
+| `docker/docker-llm-switch` | `CMD_<slot>` array mirrors `ExecStart` with `--host 0.0.0.0`; `IMAGE[<slot>]` picks which image runs the slot |
+| `systemd/harden-llm-stack.sh` | `SERVICES=()` array with `MemoryHigh/Max` and heavyweight flag |
 
-The Dockerfile `CMD` and `run.sh` are coder-slot defaults only (not per-slot).
+Llama slots all share `spark-llm-stack`. The `imagine` and `comfyui` slots use their own images (`spark-llm-imagine` from `docker/sd-server/`, `spark-llm-comfyui` from `docker/comfyui/`) — set in `IMAGE[]` in `docker/docker-llm-switch`. The Dockerfile `CMD` is the coder-slot default only (not per-slot); `docker/run.sh` is a thin wrapper that delegates to `docker-llm-switch`.
 
 ## Installation workflow
 
 Service files use `%h` (systemd home specifier) and must be installed before use:
 
 ```bash
-cp *.service ~/.config/systemd/user/
+cp systemd/units/*.service ~/.config/systemd/user/
 # Edit ExecStart binary path in each .service (default: %h/src/llama.cpp-mtp/build/bin/llama-server)
-bash harden-llm-stack.sh          # generates drop-ins in ~/.config/systemd/user/*.d/
+bash systemd/harden-llm-stack.sh  # generates drop-ins in ~/.config/systemd/user/*.d/
 systemctl --user daemon-reload
-cp llm-switch flux-gen ~/.local/bin/ && chmod +x ~/.local/bin/llm-switch ~/.local/bin/flux-gen
+cp systemd/llm-switch tools/flux-gen ~/.local/bin/ && chmod +x ~/.local/bin/llm-switch ~/.local/bin/flux-gen
 ```
 
-The `drop-ins/` directory in this repo is a **reference copy** of the generated drop-ins. The live drop-ins are at `~/.config/systemd/user/<unit>.d/override.conf`. `harden-llm-stack.sh` writes (and reverts) those live files directly.
+The `reference-previous/drop-ins/` directory is a **reference copy** of the generated drop-ins. The live drop-ins are at `~/.config/systemd/user/<unit>.d/override.conf`. `systemd/harden-llm-stack.sh` writes (and reverts) those live files directly.
 
 ## MTP binary note
 
@@ -58,14 +58,18 @@ Service files point to `%h/src/llama.cpp-mtp/build/bin/llama-server` (pre-merge 
 ## Docker workflow
 
 ```bash
-docker build -t spark-llm-stack .
-./run.sh                   # coder slot
-./run.sh architect         # architect slot
-docker-llm-switch status   # manage running containers
+# Build all three images (llama / sd-server / comfyui)
+docker compose -f docker/docker-compose.yml build
+
+cp docker/docker-llm-switch ~/.local/bin/ && chmod +x ~/.local/bin/docker-llm-switch
+./docker/run.sh                   # coder slot (llama)
+./docker/run.sh imagine           # FLUX.2-klein via sd-server
+./docker/run.sh comfyui           # ComfyUI on :8188
+docker-llm-switch status          # manage running containers
 ```
 
-`docker-llm-switch` does not cover `imagine` (FLUX) or `comfyui` — those require separate images.
+All seven slots (coder/architect/gemma/vision/gptoss/imagine/comfyui) are now in the Docker path. `imagine` and `comfyui` have their own Dockerfiles under `docker/sd-server/` and `docker/comfyui/`; llama slots share `docker/Dockerfile`. ComfyUI bind-mounts `~/comfyui/{custom_nodes,output,user}` so user-installed nodes survive image rebuilds.
 
 ## Hermes harness config
 
-Copy the relevant provider stanzas from `hermes-config-snippet.yaml` into `~/.hermes/config.yaml`. The critical fields are `max_tokens: 4096` (prevents cutoff) and per-model `temperature`/`top_k` (Qwen: `0.6`/`20`; Gemma: `1.0`/`64`).
+Copy the relevant provider stanzas from `config/hermes-config-snippet.yaml` into `~/.hermes/config.yaml`. The critical fields are `max_tokens: 4096` (prevents cutoff) and per-model `temperature`/`top_k` (Qwen: `0.6`/`20`; Gemma: `1.0`/`64`).
