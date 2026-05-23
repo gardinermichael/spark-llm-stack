@@ -240,19 +240,109 @@ echo "Explain the GB10 unified memory model" | \
   jq -r '.choices[0].message.content'
 ```
 
-**Imagine slot** — FLUX async API, easier via the `flux-gen` CLI than raw curl:
+**Imagine slot** — FLUX async API. The `flux-gen` CLI wraps the
+submit-then-poll dance and is the easiest path:
 
 ```bash
 flux-gen "a pixel art sword icon, white background"             # defaults: 512x512, 4 steps
-flux-gen "moody cyberpunk alley at night" 1024 1024 8 42         # w h steps seed
-FLUX_HOST=http://<spark-tailscale-ip>:8160 flux-gen "remote call" # remote server
+flux-gen "moody cyberpunk alley at night" 1024 1024 8 42        # w h steps seed
+FLUX_HOST=http://<spark-tailscale-ip>:8160 flux-gen "remote"    # remote server
 ```
 
-Output PNGs land in `./flux-out/` by default.
+Output PNGs land in `~/flux-output/`.
+
+<details><summary>Raw HTTP (for non-bash callers)</summary>
+
+Three endpoints under `/sdcpp/v1/`:
+
+```bash
+# 0. Server up?
+curl -s http://127.0.0.1:8160/sdcpp/v1/capabilities | jq
+
+# 1. Submit a job — returns {"id": "<job-id>"}
+JOB=$(curl -s http://127.0.0.1:8160/sdcpp/v1/img_gen \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "pixel art sword icon, white background",
+    "width": 512,
+    "height": 512,
+    "batch_count": 1,
+    "seed": -1,
+    "sample_params": {
+      "sample_steps": 4,
+      "sample_method": "euler",
+      "guidance": {"txt_cfg": 1.0, "distilled_guidance": 3.5}
+    }
+  }' | jq -r .id)
+echo "job=$JOB"
+
+# 2. Poll until status flips out of "running"/"queued"
+while :; do
+  STATUS=$(curl -s "http://127.0.0.1:8160/sdcpp/v1/jobs/$JOB" | jq -r .status)
+  echo "  status=$STATUS"
+  case "$STATUS" in completed|failed|cancelled) break;; esac
+  sleep 0.5
+done
+
+# 3. Pull the base64-encoded PNG out of the result and decode it
+curl -s "http://127.0.0.1:8160/sdcpp/v1/jobs/$JOB" \
+  | jq -r '.result.images[0].b64_json' \
+  | base64 -d > out.png
+```
+
+`seed: -1` means random. `sample_method` accepts `euler`, `euler_a`, `heun`,
+etc. (sd.cpp samplers). `guidance.distilled_guidance` is the FLUX-specific
+distilled CFG — `3.5` is a sane default for klein; bump for sharper
+prompt-adherence, lower for more creative drift.
+
+</details>
 
 **ComfyUI slot** — graph-based, not chat. Open `http://localhost:8188/` in
-a browser and use the node editor; or POST a workflow JSON to
-`/prompt` (see ComfyUI's [server API docs](https://docs.comfy.org/development/comfyui-server/comms_overview)).
+a browser and use the node editor for interactive work. For programmatic
+calls, ComfyUI exposes a JSON workflow API:
+
+```bash
+# 0. Server up?
+curl -s http://127.0.0.1:8188/system_stats | jq
+
+# 1. Build a client_id (any UUID-ish string) and submit a workflow.
+#    Export your graph from the UI: Settings -> "Enable Dev mode Options",
+#    then "Save (API Format)" — that JSON is what goes in `prompt` below.
+CLIENT_ID=$(uuidgen)
+PROMPT_ID=$(curl -s http://127.0.0.1:8188/prompt \
+  -H "Content-Type: application/json" \
+  -d "$(jq -n --arg cid "$CLIENT_ID" --slurpfile wf workflow.api.json \
+        '{client_id: $cid, prompt: $wf[0]}')" \
+  | jq -r .prompt_id)
+echo "prompt=$PROMPT_ID"
+
+# 2. Poll history until the job appears (it lands once execution finishes)
+while :; do
+  RESULT=$(curl -s "http://127.0.0.1:8188/history/$PROMPT_ID")
+  [[ "$RESULT" != "{}" ]] && break
+  sleep 1
+done
+
+# 3. Pull the output filenames out of the history and download via /view
+echo "$RESULT" \
+  | jq -r --arg id "$PROMPT_ID" '
+      .[$id].outputs[] | .images[]? |
+      "\(.filename)\t\(.subfolder // "")\t\(.type // "output")"' \
+  | while IFS=$'\t' read -r fname subfolder type; do
+      curl -s -G "http://127.0.0.1:8188/view" \
+        --data-urlencode "filename=$fname" \
+        --data-urlencode "subfolder=$subfolder" \
+        --data-urlencode "type=$type" \
+        -o "$fname"
+      echo "saved: $fname"
+    done
+```
+
+The official endpoint catalogue (`/prompt`, `/history`, `/queue`, `/view`,
+`/object_info`, the WebSocket progress feed) is documented at
+[docs.comfy.org/development/comfyui-server/comms_overview](https://docs.comfy.org/development/comfyui-server/comms_overview).
+For interactive token-by-token progress, connect to `ws://localhost:8188/ws?clientId=$CLIENT_ID`
+and watch for `executing` / `progress` / `executed` messages.
 
 ### 8. From other tools
 
