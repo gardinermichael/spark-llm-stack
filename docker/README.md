@@ -351,6 +351,111 @@ Any OpenAI-compatible client works — point its base URL at
 (or set it to a dummy string; the server ignores it). Examples: Continue,
 Aider, Hermes, Open WebUI, Cline, LiteLLM as a fan-out gateway.
 
+For the `<spark-tailscale-ip>` part, see the next section.
+
+### 9. Accessing from another machine (Tailscale)
+
+The llama servers bind to `0.0.0.0:<slot-port>` inside the container with
+`--network host`, so anything that can reach the Spark on the right port
+talks to llama-server directly. The intended access path is Tailscale —
+no port forwarding, no public exposure, end-to-end WireGuard between your
+laptop and the Spark.
+
+**On the Spark host (one-time):**
+
+```bash
+# Install
+curl -fsSL https://tailscale.com/install.sh | sh
+
+# Bring the tailnet up. --ssh enables Tailscale SSH (replaces sshd auth
+# with tailnet identity); --accept-routes is only needed if your tailnet
+# advertises subnet routes you want to follow.
+sudo tailscale up --ssh
+
+# Confirm — note the 100.x.y.z IP and the MagicDNS short name
+tailscale status
+tailscale ip -4              # just the IPv4 (e.g. 100.64.12.5)
+hostname                     # this becomes the MagicDNS shortname
+```
+
+**On the client (laptop/desktop):**
+
+```bash
+# Install (macOS: brew install --cask tailscale; Linux: curl ... | sh as above)
+sudo tailscale up
+
+# You should now see the Spark in `tailscale status`. Pick either:
+#   100.x.y.z       — raw tailnet IP, always works
+#   <hostname>      — MagicDNS shortname, requires MagicDNS enabled in admin console
+#   <hostname>.<tailnet>.ts.net  — long form, always works if MagicDNS is on
+tailscale status | grep -i spark
+```
+
+**Hitting the endpoints from the client:**
+
+```bash
+SPARK=spark                   # MagicDNS shortname, or paste the 100.x.y.z IP
+
+# Health/sanity (works once the slot is up on the Spark)
+curl -s http://$SPARK:8152/health
+curl -s http://$SPARK:8152/v1/models | jq
+
+# Chat — identical body shape to the on-host examples, just swap host
+curl -s http://$SPARK:8152/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3.6-27b-coder",
+    "messages": [{"role": "user", "content": "Hello from my laptop."}]
+  }' | jq -r '.choices[0].message.content'
+
+# FLUX from the client
+FLUX_HOST=http://$SPARK:8160 flux-gen "studio portrait, soft light"
+
+# ComfyUI web UI in a browser
+#   open http://spark:8188/
+```
+
+**Point an OpenAI-compatible client at the Spark:**
+
+| Client | Base URL field | API key field |
+|---|---|---|
+| Continue.dev | `apiBase: "http://spark:8152/v1"` | any non-empty string |
+| Aider | `--openai-api-base http://spark:8152/v1` | `--openai-api-key sk-anything` |
+| Open WebUI | OpenAI connection → URL `http://spark:8152/v1`, key any value | — |
+| LiteLLM proxy | `api_base: http://spark:8152/v1`, `model: openai/qwen3.6-27b-coder` | any value |
+| Cline / Roo | "OpenAI Compatible" provider, base `http://spark:8152/v1` | any value |
+
+**Tailscale SSH (optional but useful):**
+
+If you ran `tailscale up --ssh` on the Spark, you can SSH in without
+configuring `~/.ssh/authorized_keys` — tailnet identity is the auth:
+
+```bash
+tailscale ssh m@spark            # MagicDNS shortname
+tailscale ssh m@100.64.12.5      # raw tailnet IP also works
+```
+
+**Security notes:**
+
+- The slot ports are reachable by **every device in your tailnet**. For a
+  single-user tailnet that's fine; if multiple people share the tailnet,
+  set [Tailscale ACLs](https://tailscale.com/kb/1018/acls) to restrict
+  which devices can reach `<spark>:8152`–`8188`.
+- llama-server has **no auth** — the `Bearer ...` header is ignored.
+  Tailscale is the perimeter. Do not bind these ports to a public
+  interface; the `--host 0.0.0.0` in the container is fine because the
+  *host* network is firewalled or behind NAT, and Tailscale provides the
+  only routable path in.
+- Do **not** enable [Tailscale Funnel](https://tailscale.com/kb/1223/funnel)
+  on these ports — Funnel exposes a service to the public internet, which
+  would publish an unauthenticated llama-server. If you need browser
+  access from outside your tailnet, terminate auth at a reverse proxy
+  first.
+- `tailscale serve https://spark/coder proxy 8152` (Tailscale Serve)
+  gives you a tailnet-scoped HTTPS URL with no public exposure — handy
+  if a client refuses plain HTTP. Different from Funnel; Serve stays
+  inside the tailnet.
+
 ---
 
 ## Slot roster
