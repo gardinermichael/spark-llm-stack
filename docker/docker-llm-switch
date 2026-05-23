@@ -582,6 +582,83 @@ show_status() {
     printf "  %b%s%b" "$YLW" "yellow=tight" "$NC"
     printf "  %b%s%b\n" "$RED" "red=too large" "$NC"
   fi
+
+  # Compact health line — details via `docker-llm-switch check`.
+  _status_health_line "$GRN" "$RED" "$NC"
+  echo ""
+}
+
+# One-line health summary appended to status output.
+_status_health_line() {
+  local GRN="$1" RED="$2" NC="$3"
+  local ok=0 warn=0 out=""
+
+  _chk() {
+    local label="$1" pass="$2"
+    if [ "$pass" = "1" ]; then
+      out+="${GRN}✓${NC} $label  "; ok=$((ok+1))
+    else
+      out+="${RED}✗${NC} $label  "; warn=$((warn+1))
+    fi
+  }
+
+  _chk "earlyoom"    "$(systemctl is-active earlyoom 2>/dev/null | grep -c '^active$' || echo 0)"
+  _chk "spark-panic" "$([ -x /usr/local/bin/spark-panic ]   && echo 1 || echo 0)"
+  _chk "spark-mem"   "$([ -r "$SPARK_MEM_LIB" ]             && echo 1 || echo 0)"
+  _chk "drop-caches" "$(sudo -n sh -c 'echo 3 > /proc/sys/vm/drop_caches' 2>/dev/null && echo 1 || echo 0)"
+  _chk "cli-tools"   "$(command -v docker-llm-switch llm-switch flux-gen >/dev/null 2>&1 && echo 1 || echo 0)"
+
+  printf "  checks: %b  " "$out"
+  [ "$warn" -gt 0 ] && printf "(run 'docker-llm-switch check' for detail)\n" \
+                    || printf "\n"
+}
+
+# ── prerequisite checks ──────────────────────────────────────────────────────
+
+show_checks() {
+  local GRN=$'\033[0;32m' RED=$'\033[0;31m' YLW=$'\033[1;33m' BLD=$'\033[1m' NC=$'\033[0m'
+  [[ ! -t 1 ]] && GRN='' RED='' YLW='' BLD='' NC=''
+
+  _row() {
+    local label="$1" ok="$2" detail="$3"
+    local mark color
+    if [ "$ok" = "1" ]; then mark="✓"; color="$GRN"; else mark="✗"; color="$RED"; fi
+    printf "  %b%s%b  %-22s  %s\n" "$color" "$mark" "$NC" "$label" "$detail"
+  }
+
+  echo ""
+  printf "  %bOOM failsafe%b\n" "$BLD" "$NC"
+  printf "  %s\n" "──────────────────────────────────────────────────────────"
+
+  local earlyoom_state; earlyoom_state=$(systemctl is-active earlyoom 2>/dev/null || echo inactive)
+  _row "earlyoom" \
+    "$([ "$earlyoom_state" = active ] && echo 1 || echo 0)" \
+    "$earlyoom_state"
+
+  local panic_path=/usr/local/bin/spark-panic
+  _row "spark-panic" \
+    "$([ -x "$panic_path" ] && echo 1 || echo 0)" \
+    "${panic_path}$([ -x "$panic_path" ] || echo '  (not found — run: sudo systemd/install-earlyoom-failsafe.sh)')"
+
+  _row "spark-mem.sh" \
+    "$([ -r "$SPARK_MEM_LIB" ] && echo 1 || echo 0)" \
+    "${SPARK_MEM_LIB}$([ -r "$SPARK_MEM_LIB" ] || echo '  (not found)')"
+
+  local drop_ok=0
+  sudo -n sh -c 'echo 3 > /proc/sys/vm/drop_caches' 2>/dev/null && drop_ok=1
+  _row "drop-caches sudo" "$drop_ok" \
+    "$([ "$drop_ok" = 1 ] && echo 'NOPASSWD rule present' || echo 'not configured — run: sudo systemd/install-drop-caches-sudoers.sh')"
+
+  echo ""
+  printf "  %bCLI tools%b\n" "$BLD" "$NC"
+  printf "  %s\n" "──────────────────────────────────────────────────────────"
+
+  for tool in docker-llm-switch llm-switch flux-gen; do
+    local path; path=$(command -v "$tool" 2>/dev/null || true)
+    _row "$tool" "$([ -n "$path" ] && echo 1 || echo 0)" \
+      "${path:-not in PATH — run: tools/install-user-cli.sh}"
+  done
+
   echo ""
 }
 
@@ -989,6 +1066,9 @@ case "$CMD" in
   status)
     show_status
     ;;
+  check|doctor)
+    show_checks
+    ;;
   memory)
     show_memory_watch
     ;;
@@ -1017,6 +1097,7 @@ Runtime:
   docker-llm-switch <slot>          start one slot (stops all others)
   docker-llm-switch off             stop everything
   docker-llm-switch status          color-coded slot table with port + memory bars
+  docker-llm-switch check           verify OOM failsafe + CLI tools are installed
   docker-llm-switch memory          live memory monitor (Ctrl+C to exit)
 
 Runtime overrides (persisted across restarts):

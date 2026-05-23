@@ -105,18 +105,16 @@ section above (llama GGUFs) or [FLUX.2-klein model files](#flux2-klein-model-fil
 
 ### 5. Start a slot
 
-`docker/run.sh` calls `docker-llm-switch` under the hood — it stops every
-other `spark-llm-*` container first (mutual exclusion is enforced), then
-starts the requested slot.
+`docker-llm-switch` is the direct command — `./docker/run.sh` is a thin wrapper that calls it:
 
 ```bash
-./docker/run.sh                  # coder (Qwen3.6-27B, :8152) — default
-./docker/run.sh architect        # architect (Qwen3.6-35B MoE, :8154)
-./docker/run.sh gemma            # gemma 31B (:8156)
-./docker/run.sh vision           # gemma vision 4B (:8155)
-./docker/run.sh gptoss           # GPT-OSS-20B (:8157)
-./docker/run.sh imagine          # FLUX.2-klein via sd-server (:8160)
-./docker/run.sh comfyui          # ComfyUI (:8188)
+docker-llm-switch coder         # coder     (Qwen3.6-27B, :8152)     — or: ./docker/run.sh
+docker-llm-switch architect     # architect (Qwen3.6-35B MoE, :8154)  — or: ./docker/run.sh architect
+docker-llm-switch gemma         # gemma     (Gemma-4-31B, :8156)      — or: ./docker/run.sh gemma
+docker-llm-switch vision        # vision    (Gemma-4-E4B, :8155)      — or: ./docker/run.sh vision
+docker-llm-switch gptoss        # gptoss    (GPT-OSS-20B, :8157)      — or: ./docker/run.sh gptoss
+docker-llm-switch imagine       # imagine   (FLUX.2-klein, :8160)      — or: ./docker/run.sh imagine
+docker-llm-switch comfyui       # comfyui   (ComfyUI, :8188)           — or: ./docker/run.sh comfyui
 ```
 
 First load takes 30–90 s depending on slot. Watch logs with
