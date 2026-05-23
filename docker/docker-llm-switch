@@ -223,12 +223,12 @@ TUNABLE_KEYS=(-c --temp --top-k --top-p --min-p --presence-penalty
 
 declare -A TUNABLE_DESC=(
   [-c]="context window length (tokens)"
-  [--temp]="sampling temperature (0.0–2.0)"
+  [--temp]="sampling temperature"
   [--top-k]="top-k sampling cutoff"
-  [--top-p]="top-p nucleus sampling threshold"
+  [--top-p]="top-p nucleus sampling"
   [--min-p]="min-p token filter"
-  [--presence-penalty]="presence penalty (0.0–1.0)"
-  [--parallel]="concurrent request slots"
+  [--presence-penalty]="presence penalty"
+  [--parallel]="concurrent request slots  ⚠ see note"
   [--cache-ram]="KV cache pinned in RAM (MiB)"
   [--threads]="CPU inference threads"
   [--threads-batch]="CPU prompt-processing threads"
@@ -237,6 +237,25 @@ declare -A TUNABLE_DESC=(
   [--reasoning-budget]="max reasoning tokens (reasoning-capable slots)"
   [--spec-draft-n-max]="max speculative draft tokens (MTP coder only)"
   [--spec-draft-p-min]="min acceptance probability for MTP draft"
+)
+
+# Valid ranges shown in `config` output. Keep in sync with TUNABLE_KEYS order.
+declare -A TUNABLE_RANGE=(
+  [-c]="512–262144"
+  [--temp]="0.0–2.0"
+  [--top-k]="1–200"
+  [--top-p]="0.0–1.0"
+  [--min-p]="0.0–1.0"
+  [--presence-penalty]="0.0–1.0"
+  [--parallel]="1–2"
+  [--cache-ram]="0–65536"
+  [--threads]="1–72"
+  [--threads-batch]="1–72"
+  [--prio]="0–3"
+  [--poll]="0–1000"
+  [--reasoning-budget]="0–32768"
+  [--spec-draft-n-max]="1–10"
+  [--spec-draft-p-min]="0.0–1.0"
 )
 
 # ── override helpers ──────────────────────────────────────────────────────────
@@ -725,15 +744,19 @@ show_slot_config() {
   declare -A cur_overrides
   _load_overrides "$slot" cur_overrides
 
+  local BLD=$'\033[1m' YLW=$'\033[1;33m' NC=$'\033[0m'
+  [[ ! -t 1 ]] && BLD='' YLW='' NC=''
+
   echo ""
-  printf "  %b%s%b — runtime overrides\n" $'\033[1m' "$slot" $'\033[0m'
+  printf "  %b%s%b — runtime overrides\n" "$BLD" "$slot" "$NC"
   echo "  (overrides are applied at next container start)"
   echo ""
-  printf "  %-22s  %-12s  %-14s  %s\n" "flag" "default" "override" "description"
-  printf "  %s\n" "────────────────────────────────────────────────────────────────────────────"
+  printf "  %-22s  %-12s  %-12s  %-14s  %s\n" "flag" "default" "range" "override" "description"
+  printf "  %s\n" "──────────────────────────────────────────────────────────────────────────────────────"
 
   for flag in "${TUNABLE_KEYS[@]}"; do
     local default; default=$(_cmd_default "$slot" "$flag")
+    local range="${TUNABLE_RANGE[$flag]:--}"
     local override="${cur_overrides[$flag]:-}"
     local ovr_col
     if [ -n "$override" ]; then
@@ -741,12 +764,19 @@ show_slot_config() {
     else
       ovr_col=$(printf "%-14s" "")
     fi
-    printf "  %-22s  %-12s  %s  %s\n" "$flag" "$default" "$ovr_col" "${TUNABLE_DESC[$flag]}"
+    printf "  %-22s  %-12s  %-12s  %s  %s\n" \
+      "$flag" "$default" "$range" "$ovr_col" "${TUNABLE_DESC[$flag]}"
   done
 
   echo ""
+  printf "  %b⚠  -c × --parallel memory constraint (q8_0/q8_0 KV cache):%b\n" "$YLW" "$NC"
+  echo "     128K ctx + parallel 1  →  ~24G KV  (default — safe)"
+  echo "     256K ctx + parallel 1  →  ~48G KV  (restore full context)"
+  echo "     128K ctx + parallel 2  →  ~48G KV  (concurrent users)"
+  echo "     256K ctx + parallel 2  →  ~96G KV  ✗ busts 80G cap — do not combine"
+  echo ""
   echo "  Usage:"
-  echo "    docker-llm-switch $slot config <flag> <value>    set override (e.g. -c 65536)"
+  echo "    docker-llm-switch $slot config <flag> <value>    set override (e.g. -c 262144)"
   echo "    docker-llm-switch $slot config --reset           clear all overrides"
   echo "    docker-llm-switch $slot config --reset <flag>    clear one override"
   echo ""
