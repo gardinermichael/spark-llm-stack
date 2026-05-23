@@ -501,12 +501,13 @@ show_status() {
 
   # Header
   echo ""
-  printf "  %-10s  %-16s  %-12s  %-9s  %s\n" \
-    "slot" "memory" "state" "at-boot" "role"
-  printf "  %s\n" "──────────────────────────────────────────────────────────────────────────────"
+  printf "  %-10s  %-6s  %-15s  %-12s  %-8s  %s\n" \
+    "slot" ":port" "memory" "state" "at-boot" "role"
+  printf "  %s\n" "────────────────────────────────────────────────────────────────────────────────────"
 
   for slot in "${SLOTS[@]}"; do
     local gb; gb=$(spark_parse_gb "${MEMCAP[$slot]}")
+    local port="${PORTS[$slot]}"
     local state="${_state[$slot]}"
     local boot="${_boot[$slot]}"
 
@@ -541,15 +542,16 @@ show_status() {
     fi
 
     # ── assemble columns at fixed widths (no color inside %-* fields) ────
-    local col_slot col_mem col_state col_boot col_role
+    local col_slot col_port col_mem col_state col_boot col_role
     col_slot=$(printf "%-10s" "$slot")
-    col_mem=$(printf "%s %3dG" "$bar" "$gb")   # 10 bar + 1 space + 3+1 = 15 chars
+    col_port=$(printf "%-6s" ":$port")
+    col_mem=$(printf "%s %3dG" "$bar" "$gb")   # 10 bar + space + 3+G = 15 chars
     col_state=$(printf "%-12s" "$state_lbl")
-    col_boot=$(printf "%-9s" "$boot")
+    col_boot=$(printf "%-8s" "$boot")
     col_role="${ROLES[$slot]}"
 
-    printf "  %b%s  %s  %s  %s  %s%b\n" \
-      "$rc" "$col_slot" "$col_mem" "$col_state" "$col_boot" "$col_role" "$NC"
+    printf "  %b%s  %s  %s  %s  %s  %s%b\n" \
+      "$rc" "$col_slot" "$col_port" "$col_mem" "$col_state" "$col_boot" "$col_role" "$NC"
   done
 
   echo ""
@@ -562,6 +564,145 @@ show_status() {
     printf "  %b%s%b\n" "$RED" "red=too large" "$NC"
   fi
   echo ""
+}
+
+# ── live memory monitor ───────────────────────────────────────────────────────
+
+show_memory_watch() {
+  local RED='' GRN='' YLW='' CYN='' BLD='' NC=''
+  if [[ -t 1 ]]; then
+    RED=$'\033[0;31m' GRN=$'\033[0;32m' YLW=$'\033[1;33m'
+    CYN=$'\033[0;36m' BLD=$'\033[1m' NC=$'\033[0m'
+  fi
+
+  local TOTAL_GB=128 BAR_W=20
+
+  _mem_cleanup() { tput cnorm 2>/dev/null || true; printf '\n'; }
+  trap '_mem_cleanup; exit 0' INT TERM
+  tput civis 2>/dev/null || true
+
+  while true; do
+    # ── gather container stats ────────────────────────────────────────────
+
+    local -a running_names=()
+    for slot in "${SLOTS[@]}"; do
+      local name; name=$(ctr_name "$slot")
+      [ "$(ctr_state "$name")" = "running" ] && running_names+=("$name")
+    done
+
+    unset _ctr_use _ctr_pct
+    declare -A _ctr_use=() _ctr_pct=()
+    if [ "${#running_names[@]}" -gt 0 ]; then
+      while IFS=$'\t' read -r cname memuse mempct; do
+        [ -n "$cname" ] || continue
+        _ctr_use["$cname"]="$memuse"
+        _ctr_pct["$cname"]="${mempct//%/}"
+      done < <(docker stats --no-stream \
+        --format $'{{.Name}}\t{{.MemUsage}}\t{{.MemPerc}}' \
+        "${running_names[@]}" 2>/dev/null || true)
+    fi
+
+    # ── gather host process stats ─────────────────────────────────────────
+
+    # Read top-N host processes by RSS, excluding Docker shim overhead.
+    local ps_lines=()
+    while IFS= read -r line; do ps_lines+=("$line"); done < <(
+      ps --no-headers -eo pid,pmem,rss,comm --sort=-rss 2>/dev/null \
+        | grep -Ev 'containerd-shim|dockerd|^[[:space:]]*[0-9]+ +[0-9.]+ +[0-9]+ +ps$' \
+        | head -10 || true
+    )
+
+    # ── gather system memory ──────────────────────────────────────────────
+
+    local mem_total_used mem_total mem_avail swap_line=""
+    read -r _ mem_total_used mem_total _ _ _ mem_avail _ < <(
+      free -h 2>/dev/null | awk '/Mem:/{print $0}')
+    local swap_used swap_total
+    read -r _ swap_total swap_used _ < <(
+      free -h 2>/dev/null | awk '/Swap:/{print $0}')
+    [ "${swap_total:-0}" != "0B" ] && [ "${swap_total:-}" != "" ] && \
+      swap_line="  swap:   ${swap_used} used / ${swap_total} total"
+
+    # ── render ────────────────────────────────────────────────────────────
+
+    printf '\033[2J\033[H'   # clear + home (cursor is hidden so no flash)
+
+    local now; now=$(date '+%H:%M:%S')
+    printf "  %bspark-llm memory%b  %s  (Ctrl+C to exit)\n" "$BLD" "$NC" "$now"
+
+    # ── section 1: LLM containers ─────────────────────────────────────────
+    printf "\n  %bLLM CONTAINERS%b\n" "$BLD" "$NC"
+    printf "  %s\n" "──────────────────────────────────────────────────────────────────────────────"
+    printf "  %-12s  %-6s  %-12s  %-22s  %s\n" "slot" ":port" "cap" "used / bar" "state"
+
+    for slot in "${SLOTS[@]}"; do
+      local name; name=$(ctr_name "$slot")
+      local cap_gb; cap_gb=$(spark_parse_gb "${MEMCAP[$slot]}")
+      local port="${PORTS[$slot]}"
+      local state; state=$(ctr_state "$name")
+      local state_lbl
+      case "$state" in
+        running) state_lbl="● running" ;;
+        exited)  state_lbl="○ exited"  ;;
+        *)       state_lbl="  absent"  ;;
+      esac
+
+      local col_slot col_port col_cap
+      col_slot=$(printf "%-12s" "$slot")
+      col_port=$(printf "%-6s" ":$port")
+      col_cap=$(printf "%-12s" "${cap_gb}G")
+
+      if [ "$state" = "running" ] && [ -n "${_ctr_use[$name]:-}" ]; then
+        local pct_raw="${_ctr_pct[$name]:-0}"
+        local pct_int; pct_int=$(printf '%.0f' "$pct_raw" 2>/dev/null || echo 0)
+
+        local filled=$(( (pct_int * BAR_W + 50) / 100 ))
+        [ "$filled" -gt "$BAR_W" ] && filled=$BAR_W
+        local empty=$(( BAR_W - filled ))
+        local bar
+        bar="$(printf '%*s' "$filled" '' | tr ' ' '█')$(printf '%*s' "$empty" '' | tr ' ' '░')"
+
+        local bcolor="$GRN"
+        [ "$pct_int" -ge 60 ] && bcolor="$YLW"
+        [ "$pct_int" -ge 85 ] && bcolor="$RED"
+
+        local col_used; col_used=$(printf "%-12s" "${_ctr_use[$name]}")
+        printf "  %b%s%b  %s  %s  %s  %b%s%b %3d%%  %s\n" \
+          "$CYN" "$col_slot" "$NC" \
+          "$col_port" "$col_cap" "$col_used" \
+          "$bcolor" "$bar" "$NC" "$pct_int" "$state_lbl"
+      else
+        printf "  %s  %s  %s  %-32s  %s\n" \
+          "$col_slot" "$col_port" "$col_cap" "" "$state_lbl"
+      fi
+    done
+
+    # ── section 2: host processes ─────────────────────────────────────────
+    printf "\n  %bHOST PROCESSES%b  (top 10 by RSS, excl. Docker shims)\n" "$BLD" "$NC"
+    printf "  %s\n" "──────────────────────────────────────────────────────────────────────────────"
+    printf "  %-8s  %-6s  %-10s  %s\n" "PID" "%MEM" "RSS" "COMMAND"
+
+    for line in "${ps_lines[@]}"; do
+      local pid pmem rss comm
+      read -r pid pmem rss comm <<< "$line"
+      local rss_h
+      if   [ "${rss:-0}" -ge 1048576 ]; then rss_h=$(awk "BEGIN{printf \"%.1fG\", $rss/1048576}")
+      elif [ "${rss:-0}" -ge 1024 ];    then rss_h=$(awk "BEGIN{printf \"%.0fM\", $rss/1024}")
+      else                                   rss_h="${rss:-0}K"
+      fi
+      printf "  %-8s  %-6s  %-10s  %s\n" "$pid" "${pmem}%" "$rss_h" "$comm"
+    done
+
+    # ── section 3: system summary ─────────────────────────────────────────
+    printf "\n  %bSYSTEM%b\n" "$BLD" "$NC"
+    printf "  %s\n" "──────────────────────────────────────────────────────────────────────────────"
+    printf "  ram:    %s used / %s total / %s available\n" \
+      "$mem_total_used" "$mem_total" "$mem_avail"
+    [ -n "$swap_line" ] && printf "%s\n" "$swap_line"
+    printf "\n"
+
+    sleep 2
+  done
 }
 
 # ── config subcommand ─────────────────────────────────────────────────────────
@@ -818,6 +959,9 @@ case "$CMD" in
   status)
     show_status
     ;;
+  memory)
+    show_memory_watch
+    ;;
   boot-safe)
     boot_safe
     ;;
@@ -842,7 +986,8 @@ docker-llm-switch — Docker-native llm-switch for DGX Spark GB10
 Runtime:
   docker-llm-switch <slot>          start one slot (stops all others)
   docker-llm-switch off             stop everything
-  docker-llm-switch status          show current state + color-coded memory
+  docker-llm-switch status          color-coded slot table with port + memory bars
+  docker-llm-switch memory          live memory monitor (Ctrl+C to exit)
 
 Runtime overrides (persisted across restarts):
   docker-llm-switch <slot> config               show tunable options + active overrides
@@ -873,6 +1018,11 @@ Status color coding (when a slot is running):
   green  = fits alongside with ≥8G headroom
   yellow = fits raw but cuts into the safety headroom
   red    = too large to run in parallel
+
+Memory monitor sections:
+  LLM CONTAINERS   docker stats per slot — live used/cap bar (green/yellow/red)
+  HOST PROCESSES   top-10 host processes by RSS (Docker shims excluded)
+  SYSTEM           free -h summary, swap if present
 
 Env overrides:
   SPARK_IMAGE          llama slots image (default: spark-llm-stack)

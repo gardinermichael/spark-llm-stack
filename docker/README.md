@@ -370,7 +370,8 @@ Aider, Hermes, Open WebUI, Cline, LiteLLM as a fan-out gateway.
 ## Managing state
 
 ```bash
-docker-llm-switch status                    # what's running, ports, restart policy
+docker-llm-switch status                    # slot table: port, memory bar, color-coded fit
+docker-llm-switch memory                    # live memory monitor (Ctrl+C to exit)
 docker-llm-switch <slot>                    # switch to <slot> (stops others first)
 docker-llm-switch off                       # stop everything
 docker-llm-switch panic                     # emergency: stop everything + drop caches
@@ -380,6 +381,64 @@ docker-llm-switch boot-default architect    # only one slot ever has a restart p
 docker-llm-switch boot-status               # show what starts at daemon boot
 docker-llm-switch boot-safe                 # clear all restart policies
 ```
+
+### Status color coding
+
+`status` shows each slot with a 10-char memory bar and the container port.
+When a slot is running, idle slots are colored by whether they'd fit alongside it:
+
+| Color | Meaning |
+|-------|---------|
+| cyan  | currently running |
+| green | fits alongside with ≥8 G headroom |
+| yellow | fits raw but cuts into the safety margin |
+| red   | too large to run in parallel |
+
+Example with `coder` running (80 G cap): `architect`, `gemma` → red; `vision`, `gptoss`, `imagine`, `comfyui` → green.
+
+### Live memory monitor
+
+`docker-llm-switch memory` opens a live two-section display that refreshes every 2 s:
+
+```
+  spark-llm memory  03:45:12  (Ctrl+C to exit)
+
+  LLM CONTAINERS
+  ──────────────────────────────────────────────────────────────────────────────
+  slot          :port   cap           used / bar                              state
+  coder         :8152   80G           52.1GiB / 80GiB   ██████████████░░░░░░  65%  ● running
+  architect     :8154   80G                                                         absent
+  ...
+
+  HOST PROCESSES  (top 10 by RSS, excl. Docker shims)
+  ──────────────────────────────────────────────────────────────────────────────
+  PID        %MEM    RSS         COMMAND
+  12345      12.3%   15.8G       python3
+  ...
+
+  SYSTEM
+  ──────────────────────────────────────────────────────────────────────────────
+  ram:    67.4G used / 128G total / 60.6G available
+```
+
+The container bar tracks fill relative to its cap: green < 60 %, yellow 60–85 %, red > 85 %.
+The host processes section shows the top-10 resident-set consumers on the host (Docker shims
+are excluded so model memory shows up in the container section, not here).
+
+### Runtime overrides
+
+Persist llama.cpp flags across container restarts without editing the script:
+
+```bash
+docker-llm-switch coder config              # list 15 tunable flags + active overrides
+docker-llm-switch coder config -c 65536     # halve context window (takes effect on next start)
+docker-llm-switch coder config --temp 0.4   # lower temperature
+docker-llm-switch coder config --reset      # clear all coder overrides
+docker-llm-switch coder config --reset -c   # clear just the -c override
+```
+
+Overrides are stored in `~/.config/docker-llm-switch/overrides/<slot>` as `flag=value` lines.
+Any flag in the slot's built-in command can be overridden; unknown flags are appended with a warning.
 
 ---
 
