@@ -285,3 +285,146 @@ sudo modprobe nvidia && nvidia-smi
 # Docker GPU access (should work as soon as /dev/nvidia* exists)
 docker run --rm --gpus all nvidia/cuda:13.0.0-base-ubuntu24.04 nvidia-smi
 ```
+
+---
+
+## Debug log — lessons from the 2026-05-23 recovery
+
+What actually happened applying the fix, and gotchas worth remembering.
+
+### The apt install looks frozen at 99% on the desktop — it isn't
+
+`sudo apt install linux-modules-nvidia-580-open-$(uname -r)` triggers a
+post-install `update-initramfs` + `depmod` run that on aarch64 DGX Spark
+can take 5–15 minutes with **no visible progress**. The GUI session can
+also freeze during this window. **Do not power-cycle.** Triage via SSH:
+
+```bash
+ssh m@spark-XXXX.local
+ps -ef | grep -E 'apt|dpkg|update-initramfs|depmod' | grep -v grep
+sudo fuser /var/lib/dpkg/lock-frontend && echo "apt lock held" || echo "no apt lock"
+dpkg -l | grep linux-modules-nvidia-580-open-$(uname -r)
+```
+
+If the `ii` line is present and no apt lock is held, install finished — the
+desktop freeze is cosmetic. Host is fine.
+
+### The module auto-loads on first GPU access — no reboot required
+
+After the modules package installs, `lsmod | grep nvidia` may initially
+be empty. The module loads **lazily** when something first touches
+`/dev/nvidia*` (nvidia-smi, a Docker GPU container, even the desktop
+compositor probing). Manual `sudo modprobe nvidia` also works.
+
+The "*** System restart required ***" banner is about the *kernel*, not
+the driver. The running driver works on the running kernel; the reboot
+is to transition to whatever new kernel apt staged.
+
+### `nvidia-driver-pinning-580` branch metapackage doesn't exist on DGX OS
+
+`apt-cache search '^nvidia-driver-pinning'` shows version-specific packages
+(`nvidia-driver-pinning-580.159.03`) and branch metas for `570`, `575`,
+`590`, `595`, `610` — but **no `nvidia-driver-pinning-580` branch meta**.
+Install the version-specific match:
+
+```bash
+sudo apt install nvidia-driver-pinning-580.159.03
+```
+
+The HWE metapackage (`linux-modules-nvidia-580-open-nvidia-hwe-24.04`) is
+the load-bearing prevention — confirm with `apt-cache policy`. Pinning is
+belt-and-suspenders on top.
+
+### Docker GPU access needs a daemon restart after a driver swap
+
+NVIDIA Container Toolkit caches driver library paths at dockerd startup.
+After installing or swapping the module package, GPU containers can fail
+with `nvml error: driver not loaded` or `libnvidia-*.so` errors **even
+though `nvidia-smi` works on the host**. Fix:
+
+```bash
+sudo systemctl restart docker
+```
+
+### Containers running with `--rm` vanish on exit — capture logs proactively
+
+`docker-llm-switch` starts slots with `--rm`, so a container that crashes
+during init is gone from `docker ps -a` before you can `docker logs` it.
+Use the persistent journal instead:
+
+```bash
+journalctl --since "3 minutes ago" --no-pager \
+  | grep -iE 'spark-llm-|comfyui|GitPython|pip|oom|docker\[' | tail -120
+sudo dmesg | tail -30
+```
+
+### "Container exited" can actually mean "host rebooted underneath it"
+
+If `docker-llm-switch` reports `FAILED (container exited)` and the journal
+shows pipewire shutting down, desktop apps logging `Broken pipe`, then
+kernel `Detected PIPT I-cache on CPU0..N` lines, the **whole machine
+rebooted** mid-startup — the container didn't crash. Check:
+
+```bash
+last reboot | head -5
+journalctl --list-boots | tail -3
+```
+
+### Benign log noise during recovery — don't chase
+
+- **1 zombie process (`dbus-daemon`)** in MOTD — dbus forks helpers and
+  occasionally lags reaping. Harmless unless dozens accumulate.
+- **PCIe AER "Multiple Correctable error" on `0000:00:00.0`** during boot
+  — hardware self-corrected. Investigate only if errors are Uncorrectable
+  or repeat at runtime.
+- **`cx7-pcie-hotplug … Cable removal`** — ConnectX-7 NIC link cycling
+  during boot. Unrelated to GPU. Reseat QSFP only if network actually drops.
+
+### USB-C / DisplayPort Alt Mode does not always re-handshake after a crash
+
+If the local monitor stays blank after a reboot or desktop crash, the
+DP-Alt link over USB-C may have dropped. Diagnose from SSH:
+
+```bash
+for o in /sys/class/drm/card*-*; do
+  echo "$(basename $o): $(cat $o/status) / $(cat $o/enabled)"
+done
+```
+
+- All `disconnected` → kernel sees no monitor. **Physical fix only:**
+  unplug the USB-C cable at the Spark end, wait 3s, replug. If still
+  nothing, try a different USB-C port — not all four Spark USB-C ports
+  do DP Alt Mode (only Thunderbolt/USB4-class ones). Cable quality
+  matters: USB 2.0 / charge-only cables don't carry DP Alt Mode.
+- `connected disabled` → cable fine, GPU not driving. Try
+  `sudo systemctl restart display-manager.service`.
+- `connected enabled` → kernel is outputting; monitor is at fault
+  (asleep / wrong input source / off).
+
+Watch hot-plug events live during replug:
+
+```bash
+sudo dmesg -w | grep -iE 'drm|displayport|usb-c|hotplug|connector|HPD'
+```
+
+A successful replug prints `HPD … connected` and the corresponding
+connector flips to `connected` in `/sys/class/drm/`.
+
+### Quick triage tree
+
+```
+nvidia-smi fails
+ │
+ ├─ "driver not loaded" + /dev/nvidia* missing
+ │    → kernel-ABI mismatch (this gremlin). See "Remediation" above.
+ │
+ ├─ nvidia-smi hangs / no output
+ │    → SSH from another machine; check ps for apt/dpkg/update-initramfs.
+ │      If install in progress, wait. Else: sudo dmesg | tail -50.
+ │
+ ├─ nvidia-smi works but Docker GPU containers fail
+ │    → sudo systemctl restart docker.
+ │
+ └─ Local screen blank but SSH and nvidia-smi both work
+      → /sys/class/drm/ status check; physical USB-C replug.
+```
