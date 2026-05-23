@@ -216,8 +216,12 @@ cmd_prompt() {
     section "Prompt round-trip: $slot"
     require_cmd curl; require_cmd jq
 
+    # Snapshot FAIL_COUNT so we can detect failures from THIS health call
+    # specifically — a global "FAIL_COUNT > 0" check would skip the prompt
+    # test for every subsequent slot in `cmd_all` after the first failure.
+    local fails_before=$FAIL_COUNT
     cmd_health "$slot"
-    [[ $FAIL_COUNT -gt 0 ]] && return  # if health failed, prompt will too
+    [[ $FAIL_COUNT -gt $fails_before ]] && return  # this slot's health failed
 
     local body
     body=$(jq -n --arg m "$model_alias" \
@@ -241,9 +245,10 @@ cmd_prompt() {
         info "got: $(echo "$resp" | head -c 200)"
     fi
 
-    # /v1/models shape sanity
+    # /v1/models shape sanity — use jq's `any` so the test is order-independent
+    # (`.data[]?.id == X` would only pass if the *last* element matched).
     assert "$slot /v1/models includes alias '$model_alias'" \
-        bash -c "curl -sf http://127.0.0.1:$port/v1/models | jq -e '.data[]?.id==\"$model_alias\"' >/dev/null"
+        bash -c "curl -sf http://127.0.0.1:$port/v1/models | jq -e --arg a \"$model_alias\" 'any(.data[]?; .id == \$a)' >/dev/null"
 }
 
 # ─── 6. FLUX submit-poll round-trip ───────────────────────────────────────────
@@ -285,12 +290,17 @@ cmd_flux() {
     fi
 
     local png; png="$(mktemp -t flux-smoke-XXXX.png)"
-    if curl -sf "http://127.0.0.1:8160/sdcpp/v1/jobs/$job" \
+    if ! curl -sf "http://127.0.0.1:8160/sdcpp/v1/jobs/$job" \
         | jq -r '.result.images[0].b64_json' | base64 -d > "$png" 2>/dev/null \
-        && [[ -s "$png" ]]; then
-        pass "FLUX produced a non-empty PNG  ($(wc -c <"$png") bytes, $png)"
+        || [[ ! -s "$png" ]]; then
+        fail "FLUX result decoded to empty file"
+        return
+    fi
+    # Verify it's actually a PNG, not a base64-decoded JSON error blob.
+    if file -b "$png" 2>/dev/null | grep -q '^PNG image'; then
+        pass "FLUX produced a valid PNG  ($(wc -c <"$png") bytes, $png)"
     else
-        fail "FLUX result decoded to empty/invalid PNG"
+        fail "FLUX result is not a PNG  (file says: $(file -b "$png" 2>/dev/null | head -c 80))"
     fi
 }
 
