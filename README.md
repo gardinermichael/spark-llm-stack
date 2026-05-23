@@ -306,6 +306,134 @@ Benchmarked and tuned May 2026. All performance numbers are real.
 Memory at rest: ~8.5 GB. Peak per service: 27B ~61 GB, 35B ~48 GB.  
 Both services fit simultaneously (~77 GB combined) but exclusive operation is recommended.
 
+### Reproducing the numbers (`llama-bench`)
+
+`llama-bench` ships in the same image as `llama-server`, so the fastest
+way to bench is against a running container — no second checkout, no
+rebuild:
+
+```bash
+# Docker path
+docker-llm-switch coder
+docker/tests/smoke.sh bench coder          # n_gen=128, reps=3 (default)
+docker/tests/smoke.sh bench architect 256  # longer generation window
+
+# Or invoke llama-bench by hand (matches the runner's flags)
+docker exec spark-llm-coder /usr/local/bin/llama-bench \
+  -m /models/Qwen3.6-27B-MTP-UD-Q4_K_XL.gguf \
+  -ngl 999 -fa 1 -t 8 -p 512 -n 128 --reps 3
+
+# Systemd path
+~/src/llama.cpp-mtp/build/bin/llama-bench \
+  -m ~/models/Qwen3.6-27B-MTP-UD-Q4_K_XL.gguf \
+  -ngl 999 -fa 1 -t 8 -p 512 -n 128 --reps 3
+```
+
+Output columns to care about:
+
+| Column | Meaning | What to compare against |
+|---|---|---|
+| `pp512` (or your `-p N`) | **Prompt-prefill** throughput, tokens/sec. How fast the model digests the context before the first generated token. | 110–120 t/s for coder, 435 t/s for architect (table above). |
+| `tg128` (or your `-n N`) | **Token-generation** throughput, tokens/sec. Steady-state decode rate after prefill, no MTP. | 23.9 t/s coder, 58.5 t/s architect. |
+| `tg <N>` stdev | Run-to-run stability. | Should be < 1 t/s. >2 t/s usually means clocks aren't locked — see SMOKE-TESTS.md §0. |
+
+**`llama-bench` doesn't exercise MTP** — it benchmarks raw decode, with
+sampling and speculative paths off. To measure the MTP-accelerated rate
+the live server delivers, send a real chat completion to the slot and
+divide token count by elapsed time:
+
+```bash
+# Crude end-to-end tg measurement against the running coder slot.
+# response_completion_time and usage.completion_tokens come straight
+# out of the llama.cpp server's response shape.
+PROMPT='Count from 1 to 200 in English, each on its own line.'
+RESP=$(curl -s http://127.0.0.1:8152/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d "$(jq -n --arg p "$PROMPT" \
+    '{model:"qwen3.6-27b-coder", max_tokens:512, messages:[{role:"user", content:$p}]}')")
+
+echo "$RESP" | jq '
+  {
+    tokens: .usage.completion_tokens,
+    seconds: (.timings.predicted_ms / 1000),
+    tg_per_s: (.usage.completion_tokens / (.timings.predicted_ms / 1000))
+  }
+' && echo "$RESP" | jq '.timings'   # full timings block — field names vary by llama.cpp build
+```
+
+`tg_per_s` from this call should be ~28–30 on the MTP build (vs ~23.9
+from `llama-bench`, which doesn't speculate). The delta is the MTP win.
+The MTP accept rate appears under a build-dependent field inside
+`.timings` (commonly `draft_accept_*` or `n_draft_accept`); inspect the
+raw block above to find the one your binary emits. If `.timings` has no
+draft-related field at all, the running binary is mainline llama.cpp
+without MTP — see the "Binary note" below.
+
+---
+
+## Tunable knobs — what's safe to change vs what's load-bearing
+
+Two questions to ask before touching any flag in a `.service` file or
+`docker/docker-llm-switch`:
+
+1. **What does it cost?** Memory pressure on a 128 GB unified pool is
+   the dominant failure mode. KV cache scales linearly with `-c`,
+   linearly with `--parallel`, and inverse to KV quant (`f16` ≈ 2×
+   `q8_0`).
+2. **What does it lock you into?** GB10-specific build flags
+   (`CMAKE_CUDA_ARCHITECTURES=121a-real`, `GGML_CPU_KLEIDIAI`) are
+   measured by the maintainer; deviating from them silently regresses
+   t/s. Sampling knobs (temperature, top-k) are model-specific and
+   come from each model's published recommendations.
+
+### Frozen — do not change without measuring
+
+These are load-bearing. Each one was either picked to match a hardware
+constraint or copied from the model author's recommendation. Touching
+them is the most common way to regress throughput or correctness.
+
+| Knob | Where | Why frozen |
+|---|---|---|
+| `-DCMAKE_CUDA_ARCHITECTURES="121a-real"` | build flag | Native SM 12.1 SASS. Anything else (`121`, generic PTX) JITs at load time and silently loses ~10–15% on first request. |
+| `-DGGML_CPU_KLEIDIAI=ON` | build flag | ARM KleidiAI SVE2 GEMM kernels — single biggest aarch64 flag. |
+| `-DGGML_CUDA_FA_ALL_QUANTS=ON` | build flag | Without it, FA silently disables for q8_0 KV cache, and you lose ~40% tg. |
+| `-DGGML_CUDA_FORCE_MMQ=ON` | build flag | Quantized matmul path is faster than dequant→f16 on Blackwell. |
+| `--cache-type-k q8_0` / `--cache-type-v q8_0` | service ExecStart | KV-cache quantization. f16 doubles memory; coder + architect both already pressure-test the cap at q8_0. |
+| `--no-mmap` / `--mlock` | **must not appear** | Either flag forces the model into anonymous pages on unified memory — defeats the OS's ability to share between CPU and GPU. See `CLAUDE.md`. |
+| Sampling (`--temp`, `--top-k`, `--top-p`, `--min-p`) | service ExecStart | Per-model recommendations (Qwen: 0.6/20, Gemma: 1.0/64). Changing breaks the published behavior of the model. |
+| `--host 0.0.0.0` | docker CMD only | Docker delta vs systemd; needed for Tailscale reach. Don't apply to systemd units (they should stay loopback). |
+
+### Negotiable — common reasons to tweak
+
+These are where the dials live. Defaults match a "one heavyweight slot,
+single user, ≤128K tokens" profile.
+
+| Knob | Default | Range that's been tested | When to change |
+|---|---|---|---|
+| `-c <N>` (context window) | `131072` (128K) | 32K–262144 (256K) | Long-document work needs more context. Each doubling roughly doubles KV cost. 256K coder is ~48 GB KV at q8_0 — still under the 80 GB MemoryMax, but combined with `--parallel 2` it busts. |
+| `--parallel <N>` | `1` | 1–2 | Two concurrent users. Doubles KV cost and **halves** per-request throughput (compute is shared). Don't combine with 256K context. |
+| `-ngl <N>` (GPU layers) | `999` (all) | 999 | On unified memory there's no real reason to offload less. Listed because copy-pasted llama configs from CPU/dGPU world often set it to a partial value — don't. |
+| `-b <N>` (logical batch) | `32768` | 4096–32768 | Lower if you see OOM on first request after a long idle. No measurable tg impact at the high end on GB10. |
+| `-ub <N>` (physical micro-batch) | `8192` | 1024–8192 | Same as `-b`; tweak together. |
+| `--threads <N>` / `--threads-batch` | `8` / `16` | 4–20 | Grace has 20 cores. Defaults leave headroom for OS + Docker + container PID 1. Maxing them out can starve `flux-gen` or `docker exec`. |
+| `--spec-draft-n-max` / `--spec-draft-p-min` | `5` / `0.75` | n_max 1–8, p_min 0.5–0.9 | Per-slot MTP draft length / acceptance threshold. Lowering `p_min` accepts more drafts (more speedup if model is on-domain, more wasted compute if not). |
+| `--reasoning` + `--reasoning-budget` | `off` (coder, vision); `on` + `--reasoning-budget 4000 --reasoning-format deepseek` (architect, gemma) | `--reasoning on\|off`; budget `1000`–`8000` | Controls thinking-tag behaviour. `off` for IDE-style code completion (latency to first token matters); `on` with a budget for tool-using agents that benefit from a chain-of-thought scratchpad. Mirror across both the systemd unit and the `CMD_<slot>=( ... )` block. |
+| MemoryMax / MemoryHigh (systemd) and `--memory` (docker) | per-slot table in `docker-llm-switch` | leave alone unless you change the model | Recomputed by `harden-llm-stack.sh` and `docker-llm-switch`'s MEMCAP table. If you change a slot's model, recompute the cap from `peak_resident + KV_size + 4GB headroom`. |
+
+### Procedure for changing a negotiable knob
+
+Always mirror the change in **both** the systemd unit *and* the
+`docker-llm-switch` block (see "Adding or changing a slot" — same
+four-place rule). Then run:
+
+```bash
+docker/tests/smoke.sh prompt <slot>      # functional check
+docker/tests/smoke.sh bench <slot>       # bench before/after, compare tg
+```
+
+If the bench number moves more than ~5% in either direction without an
+explanation, treat the change as a regression and revert.
+
 ---
 
 ## Build: llama.cpp (GB10-specific flags)

@@ -1,17 +1,34 @@
 # Docker smoke tests
 
+This file is the **manual checklist** that has to pass on a real GB10
+host before any change under `docker/` is shippable. Most of it is
+automated by [`docker/tests/smoke.sh`](tests/smoke.sh) (see
+[`docker/tests/README.md`](tests/README.md)); the steps below cover the
+host-firmware and human-eye checks the script can't do on its own.
+
 CI (`.github/workflows/docker.yml`) only does Dockerfile lint + a Scout
 base-image scan — GitHub runners have no NVIDIA GPU, so the actual
-binary cannot be exercised in CI. The checklist below is the manual
-smoke-test pass that has to happen on a real GB10 host before changes
-to anything under `docker/` are considered shippable.
+binary cannot be exercised in CI.
 
-Run from the repo root unless stated otherwise.
+Run from the repo root.
 
-## 0. Before you begin — host GPU setup (mandatory on a fresh boot)
+## TL;DR — run everything the runner can
+
+```bash
+docker/tests/smoke.sh all          # static + slots + prompts + hardening + flux + comfyui
+docker/tests/smoke.sh bench coder  # optional: throughput numbers (stops the slot)
+```
+
+If `all` exits 0, the only remaining items below are the ones the
+runner intentionally does not automate (host firmware, custom-node
+persistence across rebuilds, boot-default daemon restart).
+
+---
+
+## 0. Host GPU setup (mandatory on every fresh boot)
 
 GB10 firmware does **not** persist GPU clock or power settings across
-reboots, and a power-spike during a long workflow (LTX, FLUX, heavy
+reboots, and a power spike during a long workflow (LTX, FLUX, heavy
 prefill) can hard-crash the host. Re-apply on every boot before
 exercising any slot:
 
@@ -19,168 +36,140 @@ exercising any slot:
 sudo nvidia-smi -lgc 3003,3003           # lock SM clocks to max (prevents throttling + spikes)
 sudo nvidia-smi boost-slider --vboost 1  # core-clock boost for compute workloads
 sudo nvidia-smi -pm 1                    # persistence mode (reduces driver load latency)
-
-# Verify
-nvidia-smi --query-gpu=clocks.sm,clocks.max.sm,persistence_mode --format=csv
 ```
 
-Expected: current SM clock equals max SM clock, persistence mode `Enabled`.
+Verify (under load — idle clocks won't reach the lock):
+
+```bash
+# Locked range survives reboots only if -lgc was issued THIS boot.
+nvidia-smi --query-gpu=clocks.gr,clocks.max.gr,clocks.applications.gr,persistence_mode \
+           --format=csv,noheader
+
+# Then start a slot and prefill something:
+docker-llm-switch coder
+curl -s http://127.0.0.1:8152/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"qwen3.6-27b-coder","max_tokens":256,
+       "messages":[{"role":"user","content":"Count to 256 in English."}]}' >/dev/null &
+
+# In another terminal: clocks.gr should track clocks.applications.gr
+watch -n 0.5 'nvidia-smi --query-gpu=clocks.gr,clocks.applications.gr --format=csv,noheader'
+```
+
+Expected: `clocks.gr` matches `clocks.applications.gr` during the
+prefill burst; persistence mode is `Enabled`.
 
 Source: NVIDIA Developer forum thread "Unlocking the Power of the Spark
-In ComfyUI (No Crashes)", confirmed by SparkyUI and Triplany kits. See
-`docs/architecture/DECISIONS.md` §"GPU clock-lock as an ops step".
+In ComfyUI (No Crashes)". See `docs/architecture/DECISIONS.md` §"GPU
+clock-lock as an ops step".
 
-## 1. Static checks (mandatory; no hardware needed)
+---
 
-```bash
-bash -n docker/run.sh docker/docker-llm-switch docker/comfyui/entrypoint.sh
-docker compose -f docker/docker-compose.yml config >/dev/null
-grep -nE '\-c "?[0-9]+' docker/Dockerfile docker/docker-llm-switch
-grep -nE '\-c [0-9]+' systemd/units/*.service
-```
+## 1. Static + bad-ref + slots + prompts + hardening + FLUX + ComfyUI
 
-Expected: scripts parse cleanly; compose YAML validates; the `-c`
-context-size values match between Docker CMD tables and the
-authoritative `.service` ExecStart blocks.
-
-## 2. Build all three images
+Automated:
 
 ```bash
-docker compose -f docker/docker-compose.yml build
+docker/tests/smoke.sh all
 ```
 
-Expected: three images present —
+What it covers — one PASS/FAIL line per check:
+
+| Step | What's asserted |
+|---|---|
+| `static` | All shell scripts parse (`bash -n`); compose YAML validates. |
+| `slots` | Switching to each slot leaves **exactly one** `spark-llm-*` container running; `off` leaves zero. |
+| `prompt <slot>` | `/health` reaches 200; `/v1/models` advertises the slot's `--alias`; a real `/v1/chat/completions` call returns `.choices[0].message.content` with non-empty content. Runs per llama slot. |
+| `hardening <slot>` | `NetworkMode=host`, `OomScoreAdj=200`, `Memory` byte count matches the per-slot `MEMCAP` in `docker-llm-switch`. |
+| `flux` | Submits to `/sdcpp/v1/img_gen`, polls `/sdcpp/v1/jobs/<id>` until `completed`, decodes the base64 PNG, verifies non-empty bytes. |
+| `comfyui` | `/system_stats` reachable; container logs contain the `aimdo`/`DynamicVRAM` banner (proves the GB10 unified-memory patch applied) and a SageAttention init line. |
+
+Run individual subcommands when iterating — see [tests/README.md](tests/README.md).
+
+---
+
+## 2. Bad-ref regression (separate run; slow, no cache)
+
+`smoke.sh bad-ref` is not in `all` because it kicks off three full
+`docker build` runs that should each fail near the start (the `git
+clone --branch ${REF}` step is hard-failing). Run it after any change
+that touches `--build-arg` handling or the clone command:
 
 ```bash
-docker image ls | grep ^spark-llm-
-# spark-llm-stack    (~5-6 GB,  llama.cpp)
-# spark-llm-imagine  (~3-4 GB,  sd-server)
-# spark-llm-comfyui  (~10-12 GB, ComfyUI + PyTorch + SageAttention)
+docker/tests/smoke.sh bad-ref
 ```
 
-If the ComfyUI build fails on SageAttention, pin a known-good ref:
+Expected: all three subcommands report PASS by **failing** their docker
+build (refute logic — `LLAMA_REF=no-such-ref` must not silently fall
+through to `master`).
+
+---
+
+## 3. Tailscale reachability (manual — needs a peer)
+
+The runner only hits `127.0.0.1`. Confirm that the same endpoints work
+from another tailnet member, since `--network=host` is the only thing
+making that work:
 
 ```bash
-docker compose -f docker/docker-compose.yml build \
-  --build-arg SAGE_REF=v3.0.0 comfyui
+# On a different machine joined to the tailnet:
+SPARK=spark                # MagicDNS shortname or 100.x.y.z
+
+curl -sf "http://${SPARK}:8152/health"                          # coder llama
+curl -sf "http://${SPARK}:8160/sdcpp/v1/capabilities"           # imagine
+curl -sf "http://${SPARK}:8188/system_stats"                    # comfyui
 ```
 
-## 3. Bad-ref regression tests (must FAIL)
+Expected: all three return 200 from the peer. If any fails while
+`127.0.0.1` works on the Spark, debug the host firewall / Tailscale ACL
+before anything else.
 
-The Dockerfiles must hard-fail on a typo, not silently fall through to
-`master`. Verify the f32c2f9 / sd-server / comfyui guard:
+---
 
-```bash
-# Each of these MUST exit non-zero. If any succeeds, the guard regressed.
-docker build -f docker/Dockerfile        --build-arg LLAMA_REF=no-such-ref   .
-docker build -f docker/sd-server/Dockerfile --build-arg SD_REF=no-such-ref     .
-docker build -f docker/comfyui/Dockerfile   --build-arg COMFYUI_REF=no-such-ref .
-```
+## 4. Custom-node persistence across rebuild (manual — slow, destructive)
 
-## 4. Mutual exclusion + slot startup
-
-```bash
-docker-llm-switch coder    # llama coder up; nothing else running
-docker-llm-switch architect
-docker ps --format '{{.Names}}'   # exactly one spark-llm-* container
-docker-llm-switch imagine
-docker ps --format '{{.Names}}'   # spark-llm-imagine, nothing else
-docker-llm-switch comfyui
-docker ps --format '{{.Names}}'   # spark-llm-comfyui only
-
-docker-llm-switch off
-```
-
-Expected: `docker ps` ever shows one spark-llm-* container.
-
-## 5. Readiness + host-network reachability
-
-```bash
-docker-llm-switch coder
-curl -sf http://127.0.0.1:8152/health >/dev/null && echo OK
-
-docker-llm-switch imagine
-curl -sf http://127.0.0.1:8160/sdcpp/v1/capabilities >/dev/null && echo OK
-
-docker-llm-switch comfyui
-# ComfyUI cold-start can run 60-120s; wait_ready handles this but verify:
-curl -sf http://127.0.0.1:8188/system_stats >/dev/null && echo OK
-
-# Verify comfy-aimdo (DynamicVRAM) and SageAttention v2.2 picked up:
-docker logs spark-llm-comfyui 2>&1 | grep -E 'aimdo|DynamicVRAM|SageAttention'
-# Expected lines:
-#   aimdo: comfy-aimdo inited for GPU: NVIDIA GB10 (VRAM: ~124546 MB)
-#   DynamicVRAM support detected and enabled
-```
-
-From a Tailscale peer:
-
-```bash
-TS_IP=$(tailscale ip -4)
-curl -sf "http://${TS_IP}:8152/health"
-curl -sf "http://${TS_IP}:8160/sdcpp/v1/capabilities"
-curl -sf "http://${TS_IP}:8188/system_stats"
-```
-
-Expected: all three return 200 from the LAN/Tailscale peer. Confirms
-`--network=host` exposes each slot on the host's `tailscale0` interface.
-
-## 6. Hardening parity with systemd
-
-For each running slot:
-
-```bash
-docker inspect spark-llm-<slot> --format \
-  '{{.HostConfig.OomScoreAdj}} {{.HostConfig.NetworkMode}} {{.HostConfig.Memory}}'
-```
-
-Expected:
-- `OomScoreAdj` = `200` (matches `OOMScoreAdjust=200`)
-- `NetworkMode` = `host`
-- `Memory` = the slot's MEMCAP byte count (80g llama, 16g imagine, 40g comfyui)
-
-## 7. End-to-end: FLUX image gen
-
-```bash
-docker-llm-switch imagine
-flux-gen "test prompt, white background" 512 512 4 42
-# expected: a PNG written under ~/flux-output/ within ~3 seconds
-```
-
-## 8. End-to-end: ComfyUI custom nodes persistence
+The `cp -n` seed in `docker/comfyui/entrypoint.sh` is supposed to
+*never* clobber user-installed nodes. Verify across a full rebuild:
 
 ```bash
 docker-llm-switch comfyui
-ls ~/comfyui/custom_nodes/   # ComfyUI-Manager should be present after first start
+ls ~/comfyui/custom_nodes/             # ComfyUI-Manager should be present
 # Open http://<host>:8188 → Manager → install any test node
 docker-llm-switch off
 docker rmi spark-llm-comfyui
 docker compose -f docker/docker-compose.yml build comfyui
 docker-llm-switch comfyui
-ls ~/comfyui/custom_nodes/   # the test node must still be there
+ls ~/comfyui/custom_nodes/             # the test node must still be there
 ```
 
-Expected: user-installed nodes survive container restart AND image
-rebuild (the `cp -n` seed in `entrypoint.sh` never clobbers them).
+Expected: user-installed nodes survive image rebuild. If they vanish,
+the `cp -n` regressed to `cp` somewhere.
 
-## 9. Boot-default policy + daemon-restart survival
+---
+
+## 5. Boot-default daemon-restart survival (manual — bounces all containers)
+
+Verifies the codex P1 fix (commit `4830f2c`) that ties one slot to
+`--restart unless-stopped` so it auto-recovers when Docker bounces:
 
 ```bash
 docker-llm-switch boot-default architect
 docker inspect spark-llm-architect --format '{{.HostConfig.RestartPolicy.Name}}'
 # expected: unless-stopped
 
-# Restart Docker (this WILL bounce all containers).
-sudo systemctl restart docker
+sudo systemctl restart docker        # WILL bounce every container
 
-# Wait ~30s, then:
-docker ps --format '{{.Names}}'    # spark-llm-architect should be back
+# ~30 s later:
+docker ps --format '{{.Names}}'      # spark-llm-architect should be back
 ```
 
-Expected: `architect` auto-starts after daemon restart. (This is the
-codex P1 fix from commit 4830f2c.)
+Expected: `architect` is running again. If it isn't, the boot-default
+policy isn't sticking to the slot the way `boot-default` intends.
 
-## 9b. Boot-default survives `off` → `<slot>` cycle
+### 5b. Boot-default survives off → start cycle
+
+Codex P2 regression guard (commit history under `docker-llm-switch:
+run_slot`):
 
 ```bash
 docker-llm-switch boot-default architect
@@ -193,17 +182,25 @@ docker inspect spark-llm-architect --format \
 docker-llm-switch boot-status        # expected: architect still enabled
 ```
 
-Expected: stopping and re-starting a boot-default slot preserves the
-`--restart unless-stopped` policy. Regression of this guard means the
-codex P2 fix in `run_slot` is broken — `boot-status` would lose the slot
-after the first `off` → start cycle.
+Expected: stopping and restarting a boot-default slot preserves the
+`--restart unless-stopped` policy. If `boot-status` loses the slot
+after the first `off` → start cycle, `run_slot` recreated the
+container with `--rm` instead of starting in place.
+
+---
 
 ## When to re-run
 
-- Every PR that touches `docker/**`, `tools/flux-gen`, or any `.service`
-  file under `systemd/units/`.
-- Whenever a base-image bump (`CUDA_VERSION`, `UBUNTU_VERSION`) lands.
-- Whenever PyTorch / SageAttention / ComfyUI pinned refs change.
+- **Every PR** that touches `docker/**`, `tools/flux-gen`,
+  `tools/install-user-cli.sh`, `systemd/install-*.sh`, or any
+  `systemd/units/*.service` file → `smoke.sh all` minimum.
+- **Base-image bumps** (`CUDA_VERSION`, `UBUNTU_VERSION`) → add
+  `smoke.sh bad-ref` and verify `clocks.gr` under load (step 0
+  hardware sanity).
+- **PyTorch / SageAttention / ComfyUI ref bumps** → `smoke.sh comfyui`
+  plus step 4 (custom-node persistence).
+- **`docker-llm-switch` changes** → `smoke.sh slots` plus step 5
+  (daemon-restart survival).
 
 If a smoke step fails, file the breakage with the failing command's
 output before retrying.
