@@ -44,51 +44,236 @@ Notes:
 
 ---
 
-## Quickstart
+## Quickstart (build → first response)
 
-Run from the **repo root**.
+Run everything from the **repo root** unless a step says otherwise.
+
+### 1. Build the three images
 
 ```bash
-# 1. Build all three images (llama / imagine / comfyui).
-#    Build context is the repo root so tools/flux-gen is reachable.
-#    Override LLAMA_REF / COMFYUI_REF / SD_REF via --build-arg to pin a commit.
+# Build context is the repo root so tools/flux-gen is reachable.
+# Override LLAMA_REF / COMFYUI_REF / SD_REF via --build-arg to pin a commit.
 docker compose -f docker/docker-compose.yml build
+
 # Build a single image:
 # docker compose -f docker/docker-compose.yml build comfyui
+# docker compose -f docker/docker-compose.yml build imagine
+# docker compose -f docker/docker-compose.yml build llama
+```
 
-# 2. Install user-shell CLI tools (docker-llm-switch, llm-switch, flux-gen)
-#    into ~/.local/bin/ — symlinks keep them live with repo edits, which is
-#    the intended behaviour for dev tools.
-tools/install-user-cli.sh
+The `llama` builder stage compiles llama.cpp with GB10-tuned cmake flags
+(`-DCMAKE_CUDA_ARCHITECTURES=121a-real`, `-DGGML_CPU_KLEIDIAI=ON`, flash
+attention + matmul-quant kernels). The `comfyui` build compiles
+SageAttention from source against `sm_121a` and is the slowest stage
+(~15–25 min on first run, cached afterwards).
 
-# 3. Start a slot (stops every other spark-llm-* container first).
-./docker/run.sh                  # coder (Qwen3.6-27B, :8152)
+### 2. Install the user-shell CLI tools (one-time)
+
+```bash
+tools/install-user-cli.sh        # symlinks docker-llm-switch, llm-switch, flux-gen into ~/.local/bin/
+tools/install-user-cli.sh --check
+```
+
+Symlinks (not copies) — these are dev tools, and `git pull` should refresh
+them immediately. The opposite policy applies to the OOM failsafe below,
+which is installed by copy because it's a root system service.
+
+### 3. Install the OOM failsafe (recommended, one-time, root)
+
+```bash
+sudo systemd/install-earlyoom-failsafe.sh    # earlyoom + spark-panic + spark-mem.sh
+sudo systemd/install-drop-caches-sudoers.sh  # NOPASSWD rule for page-cache flush
+systemd/install-earlyoom-failsafe.sh --check
+```
+
+Without these, two heavyweight slots running simultaneously can brick the
+box via OOM respawn — see [gremlins/00_POSTMORTEM.md](../gremlins/00_POSTMORTEM.md).
+
+### 4. Verify the model files are present
+
+Containers bind-mount `~/models` → `/models`. The slot you start needs the
+matching GGUF on disk (`gptoss` is the exception — it uses a built-in flag
+in the MTP binary and downloads nothing).
+
+```bash
+ls ~/models/
+```
+
+Missing files? See the [Model downloads](#model-downloads-one-time-before-first-run)
+section above (llama GGUFs) or [FLUX.2-klein model files](#flux2-klein-model-files)
+(imagine/comfyui weights).
+
+### 5. Start a slot
+
+`docker/run.sh` calls `docker-llm-switch` under the hood — it stops every
+other `spark-llm-*` container first (mutual exclusion is enforced), then
+starts the requested slot.
+
+```bash
+./docker/run.sh                  # coder (Qwen3.6-27B, :8152) — default
 ./docker/run.sh architect        # architect (Qwen3.6-35B MoE, :8154)
 ./docker/run.sh gemma            # gemma 31B (:8156)
 ./docker/run.sh vision           # gemma vision 4B (:8155)
 ./docker/run.sh gptoss           # GPT-OSS-20B (:8157)
 ./docker/run.sh imagine          # FLUX.2-klein via sd-server (:8160)
 ./docker/run.sh comfyui          # ComfyUI (:8188)
-
-# 4. Proof of life — /health returns {"status":"ok"} once the model is fully loaded.
-curl -s http://127.0.0.1:8152/health          # coder
-curl -s http://127.0.0.1:8188/system_stats    # comfyui
-curl -s http://127.0.0.1:8160/health          # imagine
 ```
+
+First load takes 30–90 s depending on slot. Watch logs with
+`docker logs -f spark-llm-<slot>` if you want progress.
+
+### 6. Proof of life
+
+```bash
+# Llama slots — returns {"status":"ok"} once the model is fully loaded
+curl -s http://127.0.0.1:8152/health          # coder
+curl -s http://127.0.0.1:8154/health          # architect
+curl -s http://127.0.0.1:8155/health          # vision
+curl -s http://127.0.0.1:8156/health          # gemma
+curl -s http://127.0.0.1:8157/health          # gptoss
+
+# /v1/models confirms the alias the server is advertising
+curl -s http://127.0.0.1:8152/v1/models | jq
+
+# Imagine + ComfyUI use their own endpoints
+curl -s http://127.0.0.1:8160/health          # imagine — FLUX sd-server
+curl -s http://127.0.0.1:8188/system_stats    # comfyui
+```
+
+### 7. Send your first prompt
+
+Llama slots speak the **OpenAI chat-completions API** on `/v1/chat/completions`.
+Auth is disabled — no API key needed. The `model` field is matched loosely
+against the slot's `--alias` but is recorded in server logs, so use the
+correct alias for legibility.
+
+**Coder slot (default):**
+
+```bash
+curl -s http://127.0.0.1:8152/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3.6-27b-coder",
+    "messages": [{"role": "user", "content": "Write a Python function that reverses a string."}]
+  }' | jq -r '.choices[0].message.content'
+```
+
+**Architect slot** (deeper reasoning, slower):
+
+```bash
+curl -s http://127.0.0.1:8154/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3.6-35b-architect",
+    "messages": [{"role": "user", "content": "Design a rate-limiting strategy for a multi-tenant API."}]
+  }' | jq -r '.choices[0].message.content'
+```
+
+**Gemma slot:**
+
+```bash
+curl -s http://127.0.0.1:8156/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gemma4-31b",
+    "messages": [{"role": "user", "content": "Summarise the differences between TCP and QUIC."}]
+  }' | jq -r '.choices[0].message.content'
+```
+
+**Vision slot** (multimodal — accepts images via `image_url`):
+
+```bash
+# Text only
+curl -s http://127.0.0.1:8155/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gemma4-vision",
+    "messages": [{"role": "user", "content": "What can you do?"}]
+  }' | jq -r '.choices[0].message.content'
+
+# Image + text (base64-inlined; URL form also works)
+IMG_B64=$(base64 -w 0 < /path/to/image.png)
+curl -s http://127.0.0.1:8155/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"model\": \"gemma4-vision\",
+    \"messages\": [{
+      \"role\": \"user\",
+      \"content\": [
+        {\"type\": \"text\",      \"text\": \"Describe this image.\"},
+        {\"type\": \"image_url\", \"image_url\": {\"url\": \"data:image/png;base64,${IMG_B64}\"}}
+      ]
+    }]
+  }" | jq -r '.choices[0].message.content'
+```
+
+**GPT-OSS slot:**
+
+```bash
+curl -s http://127.0.0.1:8157/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-oss-20b",
+    "messages": [{"role": "user", "content": "Explain how speculative decoding works."}]
+  }' | jq -r '.choices[0].message.content'
+```
+
+**Streaming** (token-by-token via SSE) — works on every llama slot:
+
+```bash
+curl -N http://127.0.0.1:8152/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3.6-27b-coder",
+    "stream": true,
+    "messages": [{"role": "user", "content": "Count from 1 to 10."}]
+  }'
+```
+
+**One-liner pattern** (escape-free, takes prompt from a pipe):
+
+```bash
+echo "Explain the GB10 unified memory model" | \
+  jq -Rs '{model:"qwen3.6-27b-coder", messages:[{role:"user", content:.}]}' | \
+  curl -s http://127.0.0.1:8152/v1/chat/completions \
+    -H "Content-Type: application/json" -d @- | \
+  jq -r '.choices[0].message.content'
+```
+
+**Imagine slot** — FLUX async API, easier via the `flux-gen` CLI than raw curl:
+
+```bash
+flux-gen "a pixel art sword icon, white background"             # defaults: 512x512, 4 steps
+flux-gen "moody cyberpunk alley at night" 1024 1024 8 42         # w h steps seed
+FLUX_HOST=http://<spark-tailscale-ip>:8160 flux-gen "remote call" # remote server
+```
+
+Output PNGs land in `./flux-out/` by default.
+
+**ComfyUI slot** — graph-based, not chat. Open `http://localhost:8188/` in
+a browser and use the node editor; or POST a workflow JSON to
+`/prompt` (see ComfyUI's [server API docs](https://docs.comfy.org/development/comfyui-server/comms_overview)).
+
+### 8. From other tools
+
+Any OpenAI-compatible client works — point its base URL at
+`http://<spark-tailscale-ip>:<slot-port>/v1` and leave the API key blank
+(or set it to a dummy string; the server ignores it). Examples: Continue,
+Aider, Hermes, Open WebUI, Cline, LiteLLM as a fan-out gateway.
 
 ---
 
 ## Slot roster
 
-| Slot | Model | Port | Image |
-|---|---|---|---|
-| `coder` | Qwen3.6-27B dense (MTP) | 8152 | `spark-llm-stack` |
-| `architect` | Qwen3.6-35B-A3B MoE | 8154 | `spark-llm-stack` |
-| `vision` | Gemma-4-E4B | 8155 | `spark-llm-stack` |
-| `gemma` | Gemma-4-31B | 8156 | `spark-llm-stack` |
-| `gptoss` | GPT-OSS-20B (built-in) | 8157 | `spark-llm-stack` |
-| `imagine` | FLUX.2-klein-4B | 8160 | `spark-llm-imagine` |
-| `comfyui` | ComfyUI | 8188 | `spark-llm-comfyui` |
+| Slot | Model | Port | Image | Model alias (for the `model` field) |
+|---|---|---|---|---|
+| `coder` | Qwen3.6-27B dense (MTP) | 8152 | `spark-llm-stack` | `qwen3.6-27b-coder` |
+| `architect` | Qwen3.6-35B-A3B MoE | 8154 | `spark-llm-stack` | `qwen3.6-35b-architect` |
+| `vision` | Gemma-4-E4B (multimodal) | 8155 | `spark-llm-stack` | `gemma4-vision` |
+| `gemma` | Gemma-4-31B | 8156 | `spark-llm-stack` | `gemma4-31b` |
+| `gptoss` | GPT-OSS-20B (built-in) | 8157 | `spark-llm-stack` | `gpt-oss-20b` |
+| `imagine` | FLUX.2-klein-4B | 8160 | `spark-llm-imagine` | (use `flux-gen` CLI) |
+| `comfyui` | ComfyUI | 8188 | `spark-llm-comfyui` | (graph API, not chat) |
 
 ---
 
@@ -96,12 +281,14 @@ curl -s http://127.0.0.1:8160/health          # imagine
 
 ```bash
 docker-llm-switch status                    # what's running, ports, restart policy
+docker-llm-switch <slot>                    # switch to <slot> (stops others first)
 docker-llm-switch off                       # stop everything
+docker-llm-switch panic                     # emergency: stop everything + drop caches
 
 # Auto-start one slot when the Docker daemon starts
 docker-llm-switch boot-default architect    # only one slot ever has a restart policy
-docker-llm-switch boot-status              # show what starts at daemon boot
-docker-llm-switch boot-safe               # clear all restart policies
+docker-llm-switch boot-status               # show what starts at daemon boot
+docker-llm-switch boot-safe                 # clear all restart policies
 ```
 
 ---
