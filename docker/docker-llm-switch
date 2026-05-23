@@ -677,9 +677,18 @@ show_memory_watch() {
 
   local TOTAL_GB=128 BAR_W=20
 
-  _mem_cleanup() { tput cnorm 2>/dev/null || true; printf '\n'; }
+  # Use the terminal's alternate screen buffer (the trick `top`/`vim`/`less`
+  # use). Without it, each `\033[2J` clear pushes the previous frame into
+  # scrollback, so 30 seconds of monitoring leaves hundreds of stale frames
+  # behind. With it, the watch lives in its own buffer and the terminal
+  # restores its prior contents verbatim on exit — no flicker, no scroll.
+  _mem_cleanup() {
+    printf '\033[?25h'       # show cursor
+    printf '\033[?1049l'     # leave alternate screen buffer
+  }
   trap '_mem_cleanup; exit 0' INT TERM
-  tput civis 2>/dev/null || true
+  printf '\033[?1049h'       # enter alternate screen buffer
+  printf '\033[?25l'         # hide cursor
 
   while true; do
     # ── gather container stats ────────────────────────────────────────────
@@ -714,8 +723,11 @@ show_memory_watch() {
 
     # ── gather system memory ──────────────────────────────────────────────
 
-    local mem_total_used mem_total mem_avail swap_line=""
-    read -r _ mem_total_used mem_total _ _ _ mem_avail _ < <(
+    # `free -h` Mem row columns: total used free shared buff/cache available.
+    # Previous read swapped total <-> used, so the SYSTEM section showed e.g.
+    # "ram: 121Gi used / 9Gi total / 112Gi available" — total and used reversed.
+    local mem_total mem_used mem_avail swap_line=""
+    read -r _ mem_total mem_used _ _ _ mem_avail _ < <(
       free -h 2>/dev/null | awk '/Mem:/{print $0}')
     local swap_used swap_total
     read -r _ swap_total swap_used _ < <(
@@ -725,7 +737,11 @@ show_memory_watch() {
 
     # ── render ────────────────────────────────────────────────────────────
 
-    printf '\033[2J\033[H'   # clear + home (cursor is hidden so no flash)
+    # Move cursor home only — don't clear yet. `\033[J` after the render
+    # erases anything below the new content, so a frame with fewer ps lines
+    # doesn't leave a tail from a previous frame, and we never flash an
+    # empty screen between gather and redraw.
+    printf '\033[H'
 
     local now; now=$(date '+%H:%M:%S')
     printf "  %bspark-llm memory%b  %s  (Ctrl+C to exit)\n" "$BLD" "$NC" "$now"
@@ -797,9 +813,12 @@ show_memory_watch() {
     printf "\n  %bSYSTEM%b\n" "$BLD" "$NC"
     printf "  %s\n" "──────────────────────────────────────────────────────────────────────────────"
     printf "  ram:    %s used / %s total / %s available\n" \
-      "$mem_total_used" "$mem_total" "$mem_avail"
+      "$mem_used" "$mem_total" "$mem_avail"
     [ -n "$swap_line" ] && printf "%s\n" "$swap_line"
     printf "\n"
+
+    # Erase any leftover lines from a taller previous frame.
+    printf '\033[J'
 
     sleep 2
   done
