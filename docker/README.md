@@ -210,7 +210,7 @@ print('Done')
 Notes:
 - `hf` replaces the deprecated `huggingface-cli`; both come from `pip install huggingface_hub[cli]` but older installs may still have only the old name.
 - `--local-dir-use-symlinks` was removed in newer `huggingface_hub` releases — `--local-dir` now always copies files directly.
-- The merge step needs `safetensors` + `torch`. Point `PYTHON` at any interpreter that has them installed — e.g. `PYTHON=~/jupyterlab/.venv/bin/python3` if you use the JupyterLab venv, or set up a dedicated venv with `python3 -m venv ~/.venvs/flux && ~/.venvs/flux/bin/pip install safetensors torch && export PYTHON=~/.venvs/flux/bin/python3`.
+- The merge step needs `safetensors` + `torch`. Point `PYTHON` at any interpreter that has them installed, or set up a dedicated venv: `python3 -m venv ~/.venvs/flux && ~/.venvs/flux/bin/pip install safetensors torch && export PYTHON=~/.venvs/flux/bin/python3`.
 
 ---
 
