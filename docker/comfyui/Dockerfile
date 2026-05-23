@@ -110,7 +110,7 @@ WORKDIR /build
 RUN git clone --depth 1 --branch ${SAGE_REF} ${SAGE_REPO} SageAttention
 WORKDIR /build/SageAttention
 RUN NVCC_APPEND_FLAGS="-gencode=arch=compute_121a,code=sm_121a" \
-    pip install .
+    pip install --no-build-isolation .
 
 # ── runtime ────────────────────────────────────────────────────────────────────
 FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu${UBUNTU_VERSION} AS runtime
