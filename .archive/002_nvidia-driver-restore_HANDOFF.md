@@ -1,61 +1,73 @@
-# Handoff: sudoers drop_caches rule (advisory session)
+# Handoff: Restore NVIDIA driver on DGX Spark after `apt upgrade`
 
 **Generated**: 2026-05-23
-**Branch**: dev
-**Status**: No code changes — session was purely diagnostic
+**Branch**: main
+**Status**: Diagnosis confirmed and documented — awaiting host-side `sudo` commands to apply the fix
 
 ## Goal
 
-User asked whether a specific sudoers rule for page-cache dropping works as written. No file edits were requested or made.
+Get `nvidia-smi` working again on the DGX Spark, then re-enable GPU access for
+`docker-llm-switch` (ComfyUI, FLUX, all llama slots). Root cause: the kernel
+ABI was bumped to `6.17.0-1018-nvidia` but the matching
+`linux-modules-nvidia-580-open-6.17.0-1018-nvidia` package was never
+installed, so the NVIDIA module cannot load. Full diagnosis with NVIDIA
+forum citations: [gremlins/01_NVIDIA-DRIVER-ABI-MISMATCH.md](gremlins/01_NVIDIA-DRIVER-ABI-MISMATCH.md).
 
-## Completed
+## Steps
 
-- [x] Diagnosed why the original sudoers line is broken
-- [x] Provided the correct pattern using `tee`
-
-## Not Yet Done
-
-- [ ] Apply the corrected sudoers rule to disk (if user wants it)
-
-## Failed Approaches (Don't Repeat These)
-
-None — no implementation attempted.
-
-## The Broken Rule (Do Not Use)
-
-```sudoers
-# BROKEN — semicolon is a sudoers command delimiter, not a shell operator
-m ALL=(root) NOPASSWD: /bin/sh -c sync; echo 3 > /proc/sys/vm/drop_caches
-```
-
-**Why it fails:**
-1. Sudoers parses `;` as a separator between `Cmnd_Spec` entries. The `echo 3 > /proc/sys/vm/drop_caches` portion becomes a dangling, malformed entry (parse error or silently ignored).
-2. Even if invoked as `sudo /bin/sh -c "sync; echo 3 > ..."`, sudo does exact argv matching — that string doesn't match `/bin/sh -c sync`, so sudo would deny it.
-
-## The Correct Rule
-
-```sudoers
-# Add via: sudo visudo -f /etc/sudoers.d/drop-caches
-m ALL=(root) NOPASSWD: /usr/bin/tee /proc/sys/vm/drop_caches
-```
-
-Call it as:
+### 1. Restore the driver
 
 ```bash
-sync && echo 3 | sudo tee /proc/sys/vm/drop_caches > /dev/null
+sudo apt update
+sudo apt install linux-modules-nvidia-580-open-$(uname -r)
+sudo modprobe nvidia
+nvidia-smi
 ```
 
-`sync` does not require root on modern Linux; only the write to `/proc/sys/vm/drop_caches` needs elevation. The `tee` pattern keeps the shell redirection on the user side and does the privileged write inside the elevated process — no shell interpretation in sudoers needed.
+**Expected**: `nvidia-smi` prints the GB10 GPU table (driver 580.x, CUDA 13.x).
 
-## Resume Instructions
+**If `modprobe nvidia` errors**: `sudo reboot`, then re-run `nvidia-smi` after login.
 
-1. Apply the rule: `sudo visudo -f /etc/sudoers.d/drop-caches`
-2. Paste `m ALL=(root) NOPASSWD: /usr/bin/tee /proc/sys/vm/drop_caches`, save and quit.
-3. Verify: `echo 3 | sudo tee /proc/sys/vm/drop_caches > /dev/null && echo OK`
-   - Expected: prints `3` to stdout then `OK`
-   - If denied: run `sudo -l` to confirm the rule loaded
+### 2. Verify Docker GPU access
 
-## Warnings
+```bash
+docker-llm-switch comfyui
+```
 
-- Do not add the broken rule — the `;` makes the trailing portion a parse error.
-- Unrelated but relevant: never add `--no-mmap` or `--mlock` to any llama.cpp service unit on this host (unified memory constraint — see `CLAUDE.md`).
+**Expected**: ComfyUI starts on `:8188` without `nvml error: driver not loaded`.
+
+### 3. Prevent recurrence (one-time)
+
+```bash
+sudo apt install linux-modules-nvidia-580-open-nvidia-hwe-24.04 nvidia-driver-pinning-580
+```
+
+After this, future `apt upgrade` runs will keep the kernel and the matching
+NVIDIA module package in lockstep.
+
+### 4. Pre-upgrade discipline (every future `apt upgrade`)
+
+Before rebooting after any `apt upgrade` that touches the kernel:
+
+```bash
+apt list --upgradable 2>/dev/null | grep -E 'linux-image|linux-modules-nvidia'
+```
+
+If a new `linux-image-*-nvidia` appears **without** a matching
+`linux-modules-nvidia-580-open-*-nvidia`, stop and investigate before reboot.
+
+## Don't do this
+
+- Don't `apt purge nvidia-*` to "start clean" — the DGX Spark recovery image
+  is the supported reinstall path; ad-hoc purges have bricked other users.
+- Don't install the upstream `.run` driver — the DGX Spark stack expects the
+  Ubuntu-packaged 580-open driver.
+- Don't `apt-mark hold` the kernel to dodge the problem; install the HWE
+  metapackage in step 3 instead.
+
+## References
+
+- Full incident report (diagnosis, why we're confident, NVIDIA forum citations):
+  [gremlins/01_NVIDIA-DRIVER-ABI-MISMATCH.md](gremlins/01_NVIDIA-DRIVER-ABI-MISMATCH.md)
+- Original handoff that led to this fix (archived):
+  [.archive/000_nvidia-drivers_HANDOFF.md](.archive/000_nvidia-drivers_HANDOFF.md)
