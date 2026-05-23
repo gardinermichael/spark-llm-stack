@@ -89,6 +89,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 #      let cmake build whatever it knows how to install. `llama-server`
 #      and `llama-bench` live under tools/ (LLAMA_BUILD_TOOLS, default ON),
 #      so they survive disabling examples.
+#
+# None of the choices in this RUN command are GB10-specific — the Spark/SM 12.1
+# tuning is entirely in the cmake `-D` flags (CMAKE_CUDA_ARCHITECTURES=121a-real,
+# GGML_NATIVE, GGML_CPU_KLEIDIAI, the GGML_CUDA_FA / FORCE_MMQ knobs). The
+# build-set vs install-set decisions here are about builder-stage runtime and
+# stability against upstream churn, not perf. See docker/BUILD-TUNING.md for
+# the full tradeoff and a prompt that drives a model through narrowing the
+# filter further if rebuild time becomes a bottleneck.
 COPY --from=builder /install /usr/local
 
 # flux-gen is bundled so you can: docker exec <ctr> flux-gen "prompt"
