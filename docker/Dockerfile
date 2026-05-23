@@ -55,9 +55,9 @@ RUN cmake -B build -G Ninja \
       -DGGML_CUDA_FA_ALL_QUANTS=ON \
       -DGGML_CUDA_FORCE_MMQ=ON \
       -DGGML_CPU_KLEIDIAI=ON \
-      -DLLAMA_BUILD_TESTS=OFF && \
-    cmake --build build --config Release -j${BUILD_JOBS} \
-      --target llama-server llama-bench && \
+      -DLLAMA_BUILD_TESTS=OFF \
+      -DLLAMA_BUILD_EXAMPLES=OFF && \
+    cmake --build build --config Release -j${BUILD_JOBS} && \
     cmake --install build && \
     test -x /install/bin/llama-server  # fail loudly if cmake --install produced nothing
 
@@ -80,10 +80,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 #      tagged with that component, so the filter installs nothing and /install
 #      ends up missing (build fails at this COPY with a cryptic cache-key
 #      error).
-#   2. Must set -DLLAMA_BUILD_TESTS=OFF at configure time: otherwise cmake
-#      generates install rules for test-* binaries we never built (we only
-#      --target llama-server + llama-bench), and `cmake --install` aborts
-#      trying to install non-existent test binaries.
+#   2. Must set -DLLAMA_BUILD_TESTS=OFF and -DLLAMA_BUILD_EXAMPLES=OFF at
+#      configure time. Otherwise cmake generates install rules for test-*
+#      and example binaries (e.g. llama-batched). The builder builds the
+#      full ALL target — restricting via `--target llama-server llama-bench`
+#      would leave those install rules dangling and `cmake --install`
+#      aborts on the first missing file. Keep configure-time disables and
+#      let cmake build whatever it knows how to install. `llama-server`
+#      and `llama-bench` live under tools/ (LLAMA_BUILD_TOOLS, default ON),
+#      so they survive disabling examples.
 COPY --from=builder /install /usr/local
 
 # flux-gen is bundled so you can: docker exec <ctr> flux-gen "prompt"
