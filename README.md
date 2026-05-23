@@ -111,13 +111,23 @@ failsafe that works regardless of cgroup behaviour:
 Install:
 
 ```bash
-sudo apt-get install -y earlyoom
-sudo ln -sf "$(pwd)/docker/lib/spark-mem.sh" /usr/local/lib/spark-mem.sh
-sudo ln -sf "$(pwd)/tools/spark-panic"        /usr/local/bin/spark-panic
-sudo cp systemd/units/spark-earlyoom.service  /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now spark-earlyoom.service
+sudo systemd/install-earlyoom-failsafe.sh        # installs earlyoom + the failsafe
+systemd/install-earlyoom-failsafe.sh --check     # verify install state
 ```
+
+The installer copies `spark-mem.sh` to `/usr/local/lib/`, `spark-panic` to
+`/usr/local/bin/`, drops the unit at `/etc/systemd/system/`, then
+`daemon-reload` and `enable --now`s the service. These three artifacts are
+intentionally **copied, not symlinked**: earlyoom runs as a system service
+and invokes `spark-panic` at OOM pressure, which is exactly the moment you
+cannot afford to read through a symlink into the operator's home (separate
+mount, encrypted volume, automount lag) or to have a branch checkout
+silently swap the failsafe code under the running service. Re-run the
+installer after pulling changes to those files.
+
+> The user-shell convenience symlinks under `~/.local/bin/` (see
+> "Installation" below) are a different case — those track HEAD on
+> purpose.
 
 `spark_drop_caches` uses `sudo -n` (non-interactive) so the admission gate
 never blocks on a password prompt under SSH-without-TTY or cron. Install
