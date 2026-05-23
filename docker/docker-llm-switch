@@ -820,7 +820,7 @@ show_memory_watch() {
     # Erase any leftover lines from a taller previous frame.
     printf '\033[J'
 
-    sleep 2
+    sleep "${WATCH_INTERVAL:-35}"
   done
 }
 
@@ -1167,6 +1167,7 @@ Env overrides:
   SPARK_IMAGE_COMFYUI  ComfyUI image      (default: spark-llm-comfyui)
   MODELS_DIR           host model dir     (default: \$HOME/models)
   COMFY_DIR            host comfyui dir   (default: \$HOME/comfyui)
+  WATCH_INTERVAL       memory refresh seconds (default: 35)
 EOF
     ;;
   *)
