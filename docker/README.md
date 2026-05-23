@@ -30,16 +30,16 @@ Models live on the host at `~/models/` and are bind-mounted into containers at `
 mkdir -p ~/models
 
 # NOTE: "MTP" appears in HuggingFace repo names but NOT in the filenames inside.
-huggingface-cli download unsloth/Qwen3.6-27B-MTP-GGUF  Qwen3.6-27B-UD-Q4_K_XL.gguf      --local-dir ~/models --local-dir-use-symlinks False  # coder     ~17 GB
-huggingface-cli download unsloth/Qwen3.6-35B-A3B-MTP-GGUF Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf --local-dir ~/models --local-dir-use-symlinks False  # architect ~22 GB
-huggingface-cli download unsloth/gemma-4-31B-it-GGUF    gemma-4-31B-it-UD-Q4_K_XL.gguf   --local-dir ~/models --local-dir-use-symlinks False  # gemma     ~19 GB
-huggingface-cli download unsloth/gemma-4-E4B-it-GGUF    gemma-4-E4B-it-UD-Q4_K_XL.gguf   --local-dir ~/models --local-dir-use-symlinks False  # vision    ~3 GB
+hf download unsloth/Qwen3.6-27B-MTP-GGUF  Qwen3.6-27B-UD-Q4_K_XL.gguf      --local-dir ~/models  # coder     ~17 GB
+hf download unsloth/Qwen3.6-35B-A3B-MTP-GGUF Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf --local-dir ~/models  # architect ~22 GB
+hf download unsloth/gemma-4-31B-it-GGUF    gemma-4-31B-it-UD-Q4_K_XL.gguf   --local-dir ~/models  # gemma     ~19 GB
+hf download unsloth/gemma-4-E4B-it-GGUF    gemma-4-E4B-it-UD-Q4_K_XL.gguf   --local-dir ~/models  # vision    ~3 GB
 ```
 
 Notes:
 - `gptoss` uses `--gpt-oss-20b-default` — a built-in flag in the MTP llama.cpp
   binary; no GGUF download needed.
-- `huggingface-cli` is the HuggingFace CLI. Install with: `pip install huggingface_hub[cli]`
+- `hf` is the HuggingFace CLI (`huggingface-cli` is deprecated). Install with: `pip install huggingface_hub[cli]`
 - For FLUX/imagine model files (~17 GB) see the [FLUX section](#flux2-klein-model-files) below.
 
 ---
@@ -182,20 +182,22 @@ overridden if your layout differs.
 mkdir -p ~/models/flux2-klein
 
 # Main model (~8 GB, Apache 2.0)
-huggingface-cli download black-forest-labs/FLUX.2-klein-4B \
-  flux-2-klein-4b.safetensors --local-dir ~/models/flux2-klein --local-dir-use-symlinks False
+hf download black-forest-labs/FLUX.2-klein-4B \
+  flux-2-klein-4b.safetensors --local-dir ~/models/flux2-klein
 
 # VAE (~335 MB) — rename to ae.safetensors (path expected by docker-llm-switch)
-huggingface-cli download Comfy-Org/flux2-dev \
-  split_files/vae/flux2-vae.safetensors --local-dir ~/models/flux2-klein --local-dir-use-symlinks False && \
+hf download Comfy-Org/flux2-dev \
+  split_files/vae/flux2-vae.safetensors --local-dir ~/models/flux2-klein && \
   mv ~/models/flux2-klein/split_files/vae/flux2-vae.safetensors ~/models/flux2-klein/ae.safetensors
 
 # Text encoder shards (~8 GB total)
-huggingface-cli download black-forest-labs/FLUX.2-klein-4B \
-  text_encoder/ --local-dir ~/models/flux2-klein --local-dir-use-symlinks False
+hf download black-forest-labs/FLUX.2-klein-4B \
+  text_encoder/ --local-dir ~/models/flux2-klein
 
-# Merge shards into single file (required once; run from ~/models/flux2-klein)
-cd ~/models/flux2-klein && python3 -c "
+# Merge shards into single file (required once; run from ~/models/flux2-klein).
+# Set PYTHON to any interpreter with safetensors+torch installed
+# (e.g. PYTHON=~/jupyterlab/.venv/bin/python3, or your own venv).
+cd ~/models/flux2-klein && "${PYTHON:-python3}" -c "
 from safetensors.torch import save_file, load_file
 base = 'text_encoder'
 s1 = load_file(f'{base}/model-00001-of-00002.safetensors')
@@ -204,6 +206,11 @@ save_file({**s1, **s2}, f'{base}/qwen_3_4b.safetensors')
 print('Done')
 "
 ```
+
+Notes:
+- `hf` replaces the deprecated `huggingface-cli`; both come from `pip install huggingface_hub[cli]` but older installs may still have only the old name.
+- `--local-dir-use-symlinks` was removed in newer `huggingface_hub` releases — `--local-dir` now always copies files directly.
+- The merge step needs `safetensors` + `torch`. Point `PYTHON` at any interpreter that has them installed, or set up a dedicated venv: `python3 -m venv ~/.venvs/flux && ~/.venvs/flux/bin/pip install safetensors torch && export PYTHON=~/.venvs/flux/bin/python3`.
 
 ---
 

@@ -356,18 +356,25 @@ hf download Comfy-Org/flux2-dev \
 
 # Text encoder shards (~8 GB total)
 hf download black-forest-labs/FLUX.2-klein-4B \
-  text_encoder/ --local-dir ~/models/flux2-klein/text_encoder
+  text_encoder/ --local-dir ~/models/flux2-klein
 
-# Merge shards into single file (required once)
-python3 -c "
+# Merge shards into single file (required once; run from ~/models/flux2-klein).
+# Set PYTHON to any interpreter with safetensors+torch installed
+# (e.g. PYTHON=~/jupyterlab/.venv/bin/python3, or your own venv).
+cd ~/models/flux2-klein && "${PYTHON:-python3}" -c "
 from safetensors.torch import save_file, load_file
 base = 'text_encoder'
 s1 = load_file(f'{base}/model-00001-of-00002.safetensors')
 s2 = load_file(f'{base}/model-00002-of-00002.safetensors')
 save_file({**s1, **s2}, f'{base}/qwen_3_4b.safetensors')
 print('Done')
-" 
+"
 ```
+
+Notes:
+- `hf` replaces the deprecated `huggingface-cli`; both come from `pip install huggingface_hub[cli]` but older installs may still have only the old name.
+- `--local-dir-use-symlinks` was removed in newer `huggingface_hub` releases — `--local-dir` now always copies files directly.
+- The merge step needs `safetensors` + `torch`. Point `PYTHON` at any interpreter that has them installed, or set up a dedicated venv: `python3 -m venv ~/.venvs/flux && ~/.venvs/flux/bin/pip install safetensors torch && export PYTHON=~/.venvs/flux/bin/python3`.
 
 ---
 
