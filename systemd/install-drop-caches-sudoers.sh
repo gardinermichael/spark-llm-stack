@@ -72,7 +72,9 @@ install_rule() {
 
     local tmp
     tmp="$(mktemp)"
-    trap 'rm -f "$tmp"' EXIT
+    # `tmp` is function-local; reference defensively so the EXIT trap doesn't
+    # trip `set -u` once the function has returned and the local is gone.
+    trap 'rm -f "${tmp:-}"' EXIT
 
     cat >"$tmp" <<EOF
 # Installed by systemd/install-drop-caches-sudoers.sh
