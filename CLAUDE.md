@@ -74,6 +74,12 @@ All seven slots (coder/architect/gemma/vision/gptoss/imagine/comfyui) are now in
 
 Copy the relevant provider stanzas from `config/hermes-config-snippet.yaml` into `~/.hermes/config.yaml`. The critical fields are `max_tokens: 4096` (prevents cutoff) and per-model `temperature`/`top_k` (Qwen: `0.6`/`20`; Gemma: `1.0`/`64`).
 
+## GitHub workflow rules
+
+- Always open PRs against `gardinermichael/spark-llm-stack` (the user's own fork), never against upstream forks.
+- Always pass `--repo gardinermichael/spark-llm-stack` explicitly to `gh pr create`.
+- Do not add an `upstream` remote pointing to any third-party fork.
+
 <!-- rtk-instructions v2 -->
 # RTK (Rust Token Killer) - Token-Optimized Commands
 
