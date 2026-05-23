@@ -120,15 +120,30 @@ sudo systemctl enable --now spark-earlyoom.service
 ```
 
 `spark_drop_caches` uses `sudo -n` (non-interactive) so the admission gate
-never blocks on a password prompt under SSH-without-TTY or cron. Grant
-NOPASSWD for the single command by adding this line via `sudo visudo`:
+never blocks on a password prompt under SSH-without-TTY or cron. Install
+the NOPASSWD rule with the helper script:
+
+```bash
+sudo systemd/install-drop-caches-sudoers.sh        # writes /etc/sudoers.d/drop-caches
+systemd/install-drop-caches-sudoers.sh --check     # verify rule + live test
+```
+
+The installed rule is:
 
 ```
-<your-operator-user> ALL=(root) NOPASSWD: /bin/sh -c sync; echo 3 > /proc/sys/vm/drop_caches
+<your-operator-user> ALL=(root) NOPASSWD: /usr/bin/tee /proc/sys/vm/drop_caches
 ```
 
-Without it, the failsafe still works — `drop_caches` just becomes a no-op
-and the admission gate runs against unflushed memory (visible in
+The `tee` pattern is required — sudoers parses `;` as a `Cmnd_Spec`
+separator, so the seemingly-obvious
+`/bin/sh -c "sync; echo 3 > /proc/sys/vm/drop_caches"` form cannot be
+authorised (the trailing portion becomes a malformed entry and sudo's
+exact-argv matching rejects the invocation at runtime). Routing the
+redirect through `tee` keeps shell parsing on the user side and limits
+the privileged process to one binary writing one file.
+
+Without the rule, the failsafe still works — `drop_caches` just becomes a
+no-op and the admission gate runs against unflushed memory (visible in
 `journalctl` as `drop_caches failed (sudo -n required; configure NOPASSWD)`).
 
 Verify:

@@ -169,9 +169,13 @@ spark_drop_caches() {
   # have NOPASSWD for this command, fail fast instead of hanging on a password
   # prompt (especially harmful inside an SSH-without-TTY or cron path, where
   # admission would silently proceed against unflushed memory).
-  # Install requires this sudoers line (see README "Cross-stack memory failsafe"):
-  #   <operator> ALL=(root) NOPASSWD: /bin/sh -c sync; echo 3 > /proc/sys/vm/drop_caches
-  sudo -n sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches' 2>/dev/null || {
+  # Install the sudoers rule via `sudo systemd/install-drop-caches-sudoers.sh`
+  # (writes /etc/sudoers.d/drop-caches with: <operator> ALL=(root) NOPASSWD:
+  # /usr/bin/tee /proc/sys/vm/drop_caches). The `tee` pattern is required —
+  # sudoers parses `;` as a Cmnd_Spec separator, so the obvious
+  # `sh -c "sync; echo 3 > …"` form cannot be authorised. `sync` is unprivileged.
+  sync
+  echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null 2>&1 || {
     spark_log "drop_caches failed (sudo -n required; configure NOPASSWD); continuing without flush"
     return 0
   }
