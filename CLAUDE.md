@@ -13,7 +13,7 @@ A systemd user-service LLM inference stack for NVIDIA DGX Spark GB10 (Grace Blac
 
 ## Key architectural constraint
 
-Running multiple heavyweight services simultaneously exhausts 128 GB unified memory and causes an OOM respawn brick loop (see `reference-previous/POSTMORTEM.md`). `harden-llm-stack.sh` applies `Conflicts=` drop-ins to enforce mutual exclusion at the systemd level. `docker-llm-switch` enforces the same via `stop_all_except` before every `docker run`.
+Running multiple heavyweight services simultaneously exhausts 128 GB unified memory and causes an OOM respawn brick loop (see `gremlins/00_POSTMORTEM.md`). `harden-llm-stack.sh` applies `Conflicts=` drop-ins to enforce mutual exclusion at the systemd level. `docker-llm-switch` enforces the same via `stop_all_except` before every `docker run`.
 
 ## How slots are defined (the mirroring pattern)
 
@@ -40,7 +40,7 @@ systemctl --user daemon-reload
 cp systemd/llm-switch tools/flux-gen ~/.local/bin/ && chmod +x ~/.local/bin/llm-switch ~/.local/bin/flux-gen
 ```
 
-The `reference-previous/drop-ins/` directory is a **reference copy** of the generated drop-ins. The live drop-ins are at `~/.config/systemd/user/<unit>.d/override.conf`. `systemd/harden-llm-stack.sh` writes (and reverts) those live files directly.
+The `.archive/reference-previous_drop-ins/` directory is a **reference copy** of the generated drop-ins. The live drop-ins are at `~/.config/systemd/user/<unit>.d/override.conf`. `systemd/harden-llm-stack.sh` writes (and reverts) those live files directly.
 
 ## MTP binary note
 

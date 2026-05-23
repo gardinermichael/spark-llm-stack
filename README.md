@@ -4,7 +4,9 @@ Local LLM inference stack for **NVIDIA DGX Spark (GB10 Grace Blackwell)**.
 Two deployment paths over the same model roster — systemd user-services
 (primary) and Docker containers (mirror) — bound by a shared hardening
 contract that prevents the 128 GB unified-memory OOM brick-loop documented
-in [POSTMORTEM.md](reference-previous/POSTMORTEM.md).
+in [gremlins/00_POSTMORTEM.md](gremlins/00_POSTMORTEM.md). Other known
+host-level gremlins (e.g. NVIDIA driver loss after `apt upgrade`) are
+catalogued alongside it in [gremlins/](gremlins/).
 
 ## Repo structure
 
@@ -55,11 +57,19 @@ spark-llm-stack/
 ├── config/
 │   └── hermes-config-snippet.yaml   provider stanzas for the Hermes harness
 │
-└── reference-previous/          archival material — read for context, not for execution
-    ├── POSTMORTEM.md            the OOM brick-loop incident; why the hardening exists
-    └── drop-ins/                snapshot of what harden-llm-stack.sh writes
-                                 to ~/.config/systemd/user/<unit>.d/override.conf
-                                 (live files — this is just a reference copy)
+├── gremlins/                   incident reports — one host-level failure mode per file
+│   ├── 00_POSTMORTEM.md           OOM brick-loop incident; why the hardening exists
+│   └── 01_NVIDIA-DRIVER-ABI-MISMATCH.md
+│                                  nvidia-smi dies after `apt upgrade` when the
+│                                  kernel ABI bumps without the matching
+│                                  linux-modules-nvidia-580-open-<KVER> package
+│
+└── .archive/                    retired material — kept tracked for history, not for execution
+    ├── 000_nvidia-drivers_HANDOFF.md     resolved nvidia-drivers handoff
+    ├── 001_pr3_HANDOFF.md                resolved PR #3 review remediations
+    └── reference-previous_drop-ins/      snapshot of what harden-llm-stack.sh writes
+                                          to ~/.config/systemd/user/<unit>.d/override.conf
+                                          (live files — this is just a reference copy)
 ```
 
 ## Autoresearch launcher
@@ -235,6 +245,17 @@ Benchmarked and tuned May 2026. All performance numbers are real.
 - CUDA 13.0+, driver 580+
 - SM 12.1 — **not** the same as discrete Blackwell RTX (SM 100); build flags matter
 
+> ⚠️ **Heads-up: `apt upgrade` can silently break the NVIDIA driver.**
+> The 580-open driver ships per-kernel-ABI module packages
+> (`linux-modules-nvidia-580-open-<KVER>-nvidia`). When the kernel ABI is
+> bumped, the matching module package is sometimes **not** pulled in, leaving
+> `nvidia-smi` with "driver not loaded" and no `/dev/nvidia*` devices after
+> reboot. This is a known DGX Spark / Ubuntu HWE packaging issue, not a bug
+> in this repo — see the full incident report at
+> [gremlins/01_NVIDIA-DRIVER-ABI-MISMATCH.md](gremlins/01_NVIDIA-DRIVER-ABI-MISMATCH.md)
+> for diagnosis, fix, NVIDIA-staffed forum citations, and how to prevent
+> recurrence.
+
 ---
 
 ## Model roster
@@ -370,7 +391,7 @@ cp systemd/units/*.service ~/.config/systemd/user/
 bash systemd/harden-llm-stack.sh
 
 # Or manually, copying the reference overlay:
-for d in reference-previous/drop-ins/*/; do
+for d in .archive/reference-previous_drop-ins/*/; do
   svc=$(basename "$d")
   mkdir -p ~/.config/systemd/user/$svc
   cp "$d/override.conf" ~/.config/systemd/user/$svc/
@@ -455,7 +476,7 @@ flux-gen "pixel art sword icon, white background" 512 512 4 42
 
 > **Critical on GB10.** Running multiple heavyweight services simultaneously  
 > exceeds 128 GB and causes a systemd OOM respawn loop that bricks the host.  
-> See [POSTMORTEM.md](reference-previous/POSTMORTEM.md) for the full incident report.
+> See [gremlins/00_POSTMORTEM.md](gremlins/00_POSTMORTEM.md) for the full incident report.
 
 ### Drop-ins applied by `harden-llm-stack.sh`
 
