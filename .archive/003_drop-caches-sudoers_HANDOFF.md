@@ -59,3 +59,19 @@ sync && echo 3 | sudo tee /proc/sys/vm/drop_caches > /dev/null
 
 - Do not add the broken rule — the `;` makes the trailing portion a parse error.
 - Unrelated but relevant: never add `--no-mmap` or `--mlock` to any llama.cpp service unit on this host (unified memory constraint — see `CLAUDE.md`).
+
+---
+
+## Resolution
+
+Resolved in commit `1188808` on `dev`:
+
+- Added `systemd/install-drop-caches-sudoers.sh` — installer that writes
+  `/etc/sudoers.d/drop-caches` with the correct `tee` pattern, validates
+  via `visudo -c -f` before landing the file, and offers `--check` for
+  a live non-mutating verification.
+- Fixed `docker/lib/spark-mem.sh:174` to call
+  `echo 3 | sudo -n tee /proc/sys/vm/drop_caches` instead of the
+  unauthorisable `sudo -n sh -c 'sync; echo 3 > …'` form.
+- Updated `README.md` "Cross-stack memory failsafe" section to point at
+  the installer and explain why the old `;`-form rule could never work.
