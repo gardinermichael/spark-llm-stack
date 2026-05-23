@@ -57,7 +57,8 @@ RUN cmake -B build -G Ninja \
       -DGGML_CPU_KLEIDIAI=ON && \
     cmake --build build --config Release -j${BUILD_JOBS} \
       --target llama-server llama-bench && \
-    cmake --install build --component Runtime
+    cmake --install build && \
+    test -x /install/bin/llama-server  # fail loudly if cmake --install produced nothing
 
 # ── runtime ────────────────────────────────────────────────────────────────────
 FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu${UBUNTU_VERSION} AS runtime
@@ -71,8 +72,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   && rm -rf /var/lib/apt/lists/*
 
 # Install binaries and any shared libraries produced by this llama.cpp version.
-# cmake --install captures all Runtime-component artifacts (binaries + .so files),
-# so this COPY stays correct as llama.cpp refactors its linking model over time.
+# `cmake --install` (no --component) captures everything the upstream install()
+# rules ship — binaries + .so files — so this COPY stays correct as llama.cpp
+# refactors its linking model. Don't add `--component Runtime`: llama.cpp's
+# install() targets aren't tagged with that component, so the filter installs
+# nothing and /install ends up missing (build then fails at this COPY).
 COPY --from=builder /install /usr/local
 
 # flux-gen is bundled so you can: docker exec <ctr> flux-gen "prompt"
