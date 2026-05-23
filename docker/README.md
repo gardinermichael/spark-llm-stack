@@ -56,10 +56,10 @@ docker compose -f docker/docker-compose.yml build
 # Build a single image:
 # docker compose -f docker/docker-compose.yml build comfyui
 
-# 2. Install docker-llm-switch on PATH (one-time).
-#    ln -sf keeps it live — edits to the repo script take effect immediately.
-ln -sf "$(pwd)/docker/docker-llm-switch" ~/.local/bin/docker-llm-switch
-chmod +x "$(pwd)/docker/docker-llm-switch"
+# 2. Install user-shell CLI tools (docker-llm-switch, llm-switch, flux-gen)
+#    into ~/.local/bin/ — symlinks keep them live with repo edits, which is
+#    the intended behaviour for dev tools.
+tools/install-user-cli.sh
 
 # 3. Start a slot (stops every other spark-llm-* container first).
 ./docker/run.sh                  # coder (Qwen3.6-27B, :8152)

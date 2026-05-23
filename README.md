@@ -430,10 +430,10 @@ done
 
 systemctl --user daemon-reload
 
-# Install CLI tools — symlinks keep them live with repo edits
-ln -sf "$(pwd)/systemd/llm-switch"          ~/.local/bin/llm-switch
-ln -sf "$(pwd)/tools/flux-gen"              ~/.local/bin/flux-gen
-ln -sf "$(pwd)/docker/docker-llm-switch"    ~/.local/bin/docker-llm-switch
+# Install user-shell CLI tools (symlinks into ~/.local/bin/ — track HEAD
+# on purpose, opposite of the earlyoom failsafe which is copied).
+tools/install-user-cli.sh
+tools/install-user-cli.sh --check        # verify install state
 ```
 
 ---
