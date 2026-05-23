@@ -46,6 +46,7 @@ RUN git clone --depth 1 --branch ${LLAMA_REF} ${LLAMA_REPO} llama.cpp
 WORKDIR /build/llama.cpp
 RUN cmake -B build -G Ninja \
       -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_INSTALL_PREFIX=/install \
       -DGGML_NATIVE=ON \
       -DGGML_CUDA=ON \
       -DGGML_CURL=ON \
@@ -55,7 +56,8 @@ RUN cmake -B build -G Ninja \
       -DGGML_CUDA_FORCE_MMQ=ON \
       -DGGML_CPU_KLEIDIAI=ON && \
     cmake --build build --config Release -j${BUILD_JOBS} \
-      --target llama-server llama-bench
+      --target llama-server llama-bench && \
+    cmake --install build --component Runtime
 
 # ── runtime ────────────────────────────────────────────────────────────────────
 FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu${UBUNTU_VERSION} AS runtime
@@ -68,8 +70,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-requests \
   && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /build/llama.cpp/build/bin/llama-server  /usr/local/bin/llama-server
-COPY --from=builder /build/llama.cpp/build/bin/llama-bench   /usr/local/bin/llama-bench
+# Install binaries and any shared libraries produced by this llama.cpp version.
+# cmake --install captures all Runtime-component artifacts (binaries + .so files),
+# so this COPY stays correct as llama.cpp refactors its linking model over time.
+COPY --from=builder /install /usr/local
 
 # flux-gen is bundled so you can: docker exec <ctr> flux-gen "prompt"
 # It's an HTTP client; set FLUX_HOST=http://<addr>:8160 to target a remote server.
