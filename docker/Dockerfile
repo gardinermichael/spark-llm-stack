@@ -54,7 +54,8 @@ RUN cmake -B build -G Ninja \
       -DGGML_CUDA_FA=ON \
       -DGGML_CUDA_FA_ALL_QUANTS=ON \
       -DGGML_CUDA_FORCE_MMQ=ON \
-      -DGGML_CPU_KLEIDIAI=ON && \
+      -DGGML_CPU_KLEIDIAI=ON \
+      -DLLAMA_BUILD_TESTS=OFF && \
     cmake --build build --config Release -j${BUILD_JOBS} \
       --target llama-server llama-bench && \
     cmake --install build && \
@@ -74,9 +75,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Install binaries and any shared libraries produced by this llama.cpp version.
 # `cmake --install` (no --component) captures everything the upstream install()
 # rules ship — binaries + .so files — so this COPY stays correct as llama.cpp
-# refactors its linking model. Don't add `--component Runtime`: llama.cpp's
-# install() targets aren't tagged with that component, so the filter installs
-# nothing and /install ends up missing (build then fails at this COPY).
+# refactors its linking model. Two gotchas baked into the builder above:
+#   1. Don't add `--component Runtime`: llama.cpp's install() targets aren't
+#      tagged with that component, so the filter installs nothing and /install
+#      ends up missing (build fails at this COPY with a cryptic cache-key
+#      error).
+#   2. Must set -DLLAMA_BUILD_TESTS=OFF at configure time: otherwise cmake
+#      generates install rules for test-* binaries we never built (we only
+#      --target llama-server + llama-bench), and `cmake --install` aborts
+#      trying to install non-existent test binaries.
 COPY --from=builder /install /usr/local
 
 # flux-gen is bundled so you can: docker exec <ctr> flux-gen "prompt"
