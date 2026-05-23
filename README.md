@@ -112,10 +112,9 @@ Install:
 
 ```bash
 sudo apt-get install -y earlyoom
-sudo cp docker/lib/spark-mem.sh    /usr/local/lib/spark-mem.sh
-sudo cp tools/spark-panic          /usr/local/bin/spark-panic
-sudo chmod +x /usr/local/bin/spark-panic
-sudo cp systemd/units/spark-earlyoom.service /etc/systemd/system/
+sudo ln -sf "$(pwd)/docker/lib/spark-mem.sh" /usr/local/lib/spark-mem.sh
+sudo ln -sf "$(pwd)/tools/spark-panic"        /usr/local/bin/spark-panic
+sudo cp systemd/units/spark-earlyoom.service  /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now spark-earlyoom.service
 ```
@@ -406,13 +405,10 @@ done
 
 systemctl --user daemon-reload
 
-# Install CLI tools
-cp systemd/llm-switch ~/.local/bin/ && chmod +x ~/.local/bin/llm-switch
-cp tools/flux-gen ~/.local/bin/ && chmod +x ~/.local/bin/flux-gen
-
-# (Optional) Docker path — symlink keeps it live with repo edits
-ln -sf "$(pwd)/docker/docker-llm-switch" ~/.local/bin/docker-llm-switch
-chmod +x "$(pwd)/docker/docker-llm-switch"
+# Install CLI tools — symlinks keep them live with repo edits
+ln -sf "$(pwd)/systemd/llm-switch"          ~/.local/bin/llm-switch
+ln -sf "$(pwd)/tools/flux-gen"              ~/.local/bin/flux-gen
+ln -sf "$(pwd)/docker/docker-llm-switch"    ~/.local/bin/docker-llm-switch
 ```
 
 ---
