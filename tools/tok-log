@@ -108,6 +108,7 @@ CREATE TABLE IF NOT EXISTS runs (
     min_p               REAL,
     reasoning           TEXT,
     reasoning_budget    INTEGER,
+    reasoning_format    TEXT,
 
     -- timings
     n_predict_req       INTEGER,
@@ -156,6 +157,7 @@ def db_connect():
         "threads": "INTEGER", "threads_batch": "INTEGER",
         "temp": "REAL", "top_k": "INTEGER", "top_p": "REAL", "min_p": "REAL",
         "reasoning": "TEXT", "reasoning_budget": "INTEGER",
+        "reasoning_format": "TEXT",
         "cmd_source": "TEXT", "cmd_argv": "TEXT", "flags": "TEXT",
         "overrides": "TEXT",
     }
@@ -192,7 +194,7 @@ VALUE_FLAGS = {
     "--ctx-checkpoints", "--parallel", "--threads", "--threads-batch",
     "--threads-http", "--prio", "--poll", "--spec-type",
     "--spec-draft-n-max", "--spec-draft-n-min", "--spec-draft-p-min",
-    "--reasoning", "--reasoning-budget",
+    "--reasoning", "--reasoning-budget", "--reasoning-format",
     "--temp", "--top-k", "--top-p", "--min-p", "--presence-penalty",
     "--keep", "-fa",
 }
@@ -416,6 +418,7 @@ def cmd_bench(args):
         "min_p": _f(flags, "--min-p", float),
         "reasoning": _f(flags, "--reasoning", str),
         "reasoning_budget": _f(flags, "--reasoning-budget", int),
+        "reasoning_format": _f(flags, "--reasoning-format", str),
 
         "n_predict_req": args.n_predict,
         "prompt_tokens": timings.get("prompt_n"),

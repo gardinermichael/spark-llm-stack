@@ -1618,6 +1618,25 @@ is_slot() {
   return 1
 }
 
+# Locate the tok-log script. Prefers the installed symlink at
+# ~/.local/bin/tok-log, falls back to the repo copy alongside this script,
+# then to $PATH. Echoes the path on success; returns 1 if none found.
+_find_tok_log() {
+  local candidates=(
+    "$HOME/.local/bin/tok-log"
+    "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)/tools/tok-log"
+  )
+  local c
+  for c in "${candidates[@]}"; do
+    [ -n "$c" ] && [ -x "$c" ] && { echo "$c"; return 0; }
+  done
+  if command -v tok-log >/dev/null 2>&1; then
+    command -v tok-log
+    return 0
+  fi
+  return 1
+}
+
 if is_slot "$CMD"; then
   # Handle per-slot subcommands before any container logic.
   SUBCMD="${2:-}"
@@ -1673,6 +1692,27 @@ if is_slot "$CMD"; then
       fi
       exec docker logs "${@:3}" "$name"
       ;;
+    bench)
+      # Run a token-speed benchmark against the slot and record the result
+      # (with full effective argv + model + flags) to SQLite. Llama slots
+      # only — imagine/comfyui don't expose /completion.
+      case "$CMD" in
+        imagine|comfyui)
+          echo "$CMD has no /completion endpoint — bench is for llama slots only." >&2
+          exit 1
+          ;;
+      esac
+      tok_log=$(_find_tok_log) || {
+        echo "tok-log not found. Install with: tools/install-user-cli.sh" >&2
+        exit 1
+      }
+      name=$(ctr_name "$CMD")
+      if [ "$(ctr_state "$name")" != "running" ]; then
+        echo "$CMD is not running — start it first with \`docker-llm-switch $CMD\`." >&2
+        exit 1
+      fi
+      exec "$tok_log" bench "$CMD" "${@:3}"
+      ;;
     debug)
       # Start the slot WITHOUT --rm so the container (and its logs) survive
       # a crash. Useful when llama-server SIGTRAPs / SIGABRTs / SIGSEGVs
@@ -1715,7 +1755,7 @@ if is_slot "$CMD"; then
       ;;
     *)
       echo "unknown subcommand for slot '$CMD': $SUBCMD" >&2
-      echo "valid subcommands: config | stop | restart | debug | logs" >&2
+      echo "valid subcommands: config | stop | restart | debug | logs | bench" >&2
       exit 1
       ;;
   esac
@@ -1806,6 +1846,22 @@ case "$CMD" in
   panic)
     spark_panic_stop_all
     ;;
+  log|bench-log)
+    # Forward to tok-log. `docker-llm-switch log` with no sub = list.
+    # Examples:
+    #   docker-llm-switch log                       (recent runs)
+    #   docker-llm-switch log list --slot coder
+    #   docker-llm-switch log show 42
+    #   docker-llm-switch log db-path
+    tok_log=$(_find_tok_log) || {
+      echo "tok-log not found. Install with: tools/install-user-cli.sh" >&2
+      exit 1
+    }
+    if [ $# -lt 2 ]; then
+      exec "$tok_log" list
+    fi
+    exec "$tok_log" "${@:2}"
+    ;;
   -h|--help|help)
     cat <<EOF
 docker-llm-switch — Docker-native llm-switch for DGX Spark GB10
@@ -1818,6 +1874,13 @@ Runtime:
                                     follows logs live (Ctrl+C detaches, container keeps running)
   docker-llm-switch <slot> logs …   shortcut for \`docker logs spark-llm-<slot>\`
                                     (e.g. logs -f, logs --tail 200, logs --since 5m)
+  docker-llm-switch <slot> bench [--prompt … --n-predict N --tag X]
+                                    benchmark the slot with a controlled prompt and
+                                    log timings + effective argv + model to SQLite.
+                                    Llama slots only (not imagine/comfyui).
+  docker-llm-switch log [list|show|db-path …]
+                                    inspect the token-speed log (default: \`list\`).
+                                    e.g. \`log list --slot coder\`, \`log show 42\`.
   docker-llm-switch off             stop everything
   docker-llm-switch status          color-coded slot table with port + memory bars
   docker-llm-switch health          verify OOM failsafe, CLI tools, and installed-file drift
