@@ -745,6 +745,74 @@ show_health() {
     fi
   done
 
+  # ── installed-file drift ────────────────────────────────────────────────
+  # Two distinct policies:
+  #   1. user CLIs in ~/.local/bin are symlinks into the repo (track HEAD);
+  #      a copy is flagged even with matching content because it won't pick
+  #      up future `git pull`s.
+  #   2. /usr/local/{lib,bin}/spark-{mem.sh,panic} are intentional copies
+  #      installed by sudo; drift is content mismatch vs the repo source.
+  local repo=""
+  if repo=$(_repo_root 2>/dev/null); then
+    echo ""
+    printf "  %bInstalled file sync%b  %b(repo: %s)%b\n" "$BLD" "$NC" "$DIM" "$repo" "$NC"
+    printf "  %s\n" "──────────────────────────────────────────────────────────"
+
+    local entry name rel dst src target
+    for entry in \
+        "docker-llm-switch:docker/docker-llm-switch" \
+        "llm-switch:systemd/llm-switch" \
+        "flux-gen:tools/flux-gen"; do
+      name="${entry%%:*}"
+      rel="${entry#*:}"
+      dst="$HOME/.local/bin/$name"
+      src="$repo/$rel"
+      if [ ! -e "$dst" ] && [ ! -L "$dst" ]; then
+        # Absent: already counted in the CLI tools section; skip.
+        continue
+      fi
+      if [ -L "$dst" ]; then
+        target=$(readlink "$dst")
+        if [ "$target" = "$src" ]; then
+          _row "$name" 1 "symlink → repo"
+        else
+          _row "$name" 0 "symlink → $target  (expected $src)"
+          _need user-cli
+        fi
+      else
+        if [ -f "$src" ] && cmp -s "$dst" "$src"; then
+          _row "$name" 0 "regular file (matches repo, but won't track \`git pull\`)"
+        else
+          _row "$name" 0 "regular file out of sync with $src"
+        fi
+        _need user-cli
+      fi
+    done
+
+    for entry in \
+        "/usr/local/lib/spark-mem.sh:docker/lib/spark-mem.sh" \
+        "/usr/local/bin/spark-panic:tools/spark-panic"; do
+      dst="${entry%%:*}"
+      rel="${entry#*:}"
+      src="$repo/$rel"
+      name=$(basename "$dst")
+      if [ ! -e "$dst" ]; then
+        # Absent: already counted in the OOM-failsafe section above; skip.
+        continue
+      fi
+      if [ ! -f "$src" ]; then
+        _row "$name" 0 "repo source missing ($src)"
+        continue
+      fi
+      if cmp -s "$dst" "$src"; then
+        _row "$name" 1 "matches repo"
+      else
+        _row "$name" 0 "out of sync with $src"
+        _need earlyoom-failsafe
+      fi
+    done
+  fi
+
   echo ""
   if [ "$fail_count" -eq 0 ]; then
     printf "  %ball checks passed%b\n\n" "$GRN" "$NC"
@@ -801,7 +869,13 @@ _offer_remediation() {
         ;;
       user-cli)
         labels+=("user CLI symlinks (~/.local/bin)")
-        cmds+=("$repo/tools/install-user-cli.sh")
+        # install-user-cli.sh refuses to clobber a regular file at the dst
+        # (line 68-71 of that script) — a safety guard for direct CLI use.
+        # The health flow has already identified these exact paths as
+        # drifted, so we clear them first and let the installer recreate
+        # them as symlinks. `rm -f` is harmless on missing files and on
+        # the symlinks the installer itself owns.
+        cmds+=("rm -f \"\$HOME/.local/bin/docker-llm-switch\" \"\$HOME/.local/bin/llm-switch\" \"\$HOME/.local/bin/flux-gen\" && \"$repo/tools/install-user-cli.sh\"")
         ;;
     esac
   done
@@ -1344,7 +1418,8 @@ Runtime:
   docker-llm-switch <slot> restart  recreate that slot's container (applies any config changes)
   docker-llm-switch off             stop everything
   docker-llm-switch status          color-coded slot table with port + memory bars
-  docker-llm-switch health          verify OOM failsafe + CLI tools, offer to fix anything failing
+  docker-llm-switch health          verify OOM failsafe, CLI tools, and installed-file drift
+                                    (vs the repo); offer to fix anything failing
                                     (aliases: check, doctor)
   docker-llm-switch memory          live memory monitor (Ctrl+C to exit)
 
