@@ -753,7 +753,7 @@ show_health() {
   printf "  %s\n" "──────────────────────────────────────────────────────────"
 
   local tool path
-  for tool in docker-llm-switch llm-switch flux-gen; do
+  for tool in docker-llm-switch llm-switch flux-gen tok-log; do
     path=$(command -v "$tool" 2>/dev/null || true)
     if [ -n "$path" ]; then
       _row "$tool" 1 "$path"
@@ -780,7 +780,8 @@ show_health() {
     for entry in \
         "docker-llm-switch:docker/docker-llm-switch" \
         "llm-switch:systemd/llm-switch" \
-        "flux-gen:tools/flux-gen"; do
+        "flux-gen:tools/flux-gen" \
+        "tok-log:tools/tok-log"; do
       name="${entry%%:*}"
       rel="${entry#*:}"
       dst="$HOME/.local/bin/$name"
@@ -827,6 +828,54 @@ show_health() {
       else
         _row "$name" 0 "out of sync with $src"
         _need earlyoom-failsafe
+      fi
+    done
+  fi
+
+  # ── token-speed logging ────────────────────────────────────────────────
+  # Verify the SQLite DB is writable and report which llama slots have a
+  # live watcher. A running slot without a watcher means missing log data
+  # but is recoverable (re-running `docker-llm-switch <slot>` respawns it
+  # from the idempotent path), so it's a warning row, not a hard fail.
+  echo ""
+  printf "  %bToken-speed logging%b\n" "$BLD" "$NC"
+  printf "  %s\n" "──────────────────────────────────────────────────────────"
+
+  local db_path="${TOK_LOG_DB:-${XDG_DATA_HOME:-$HOME/.local/share}/spark-llm-stack/token-speed.db}"
+  local db_dir; db_dir=$(dirname "$db_path")
+  if mkdir -p "$db_dir" 2>/dev/null && [ -w "$db_dir" ]; then
+    if [ -e "$db_path" ]; then
+      if [ -w "$db_path" ]; then
+        local sz; sz=$(du -h "$db_path" 2>/dev/null | cut -f1)
+        _row "SQLite DB" 1 "$db_path  (${sz:-?})"
+      else
+        _row "SQLite DB" 0 "$db_path  (not writable)"
+      fi
+    else
+      _row "SQLite DB" 1 "$db_dir  (writable, db not yet created)"
+    fi
+  else
+    _row "SQLite DB" 0 "$db_dir  (cannot create or not writable)"
+  fi
+
+  if [ "${DOCKER_LLM_SWITCH_NO_WATCH:-0}" = "1" ]; then
+    _row "auto-watcher" 1 "disabled (DOCKER_LLM_SWITCH_NO_WATCH=1)"
+  else
+    local wdir="${XDG_RUNTIME_DIR:-/tmp}/docker-llm-switch"
+    local llama_slot ctr_state_v wpid
+    for llama_slot in coder architect gemma vision gptoss; do
+      ctr_state_v=$(ctr_state "$(ctr_name "$llama_slot")")
+      [ "$ctr_state_v" != "running" ] && continue
+      local pf="$wdir/watcher-$llama_slot.pid"
+      if [ -f "$pf" ]; then
+        wpid=$(cat "$pf" 2>/dev/null)
+        if [ -n "$wpid" ] && kill -0 "$wpid" 2>/dev/null; then
+          _row "watcher ($llama_slot)" 1 "pid $wpid"
+        else
+          _row "watcher ($llama_slot)" 0 "stale pid file (pid $wpid gone)  → \`docker-llm-switch $llama_slot\` to respawn"
+        fi
+      else
+        _row "watcher ($llama_slot)" 0 "container running but no watcher  → \`docker-llm-switch $llama_slot\` to respawn"
       fi
     done
   fi
@@ -893,7 +942,7 @@ _offer_remediation() {
         # drifted, so we clear them first and let the installer recreate
         # them as symlinks. `rm -f` is harmless on missing files and on
         # the symlinks the installer itself owns.
-        cmds+=("rm -f \"\$HOME/.local/bin/docker-llm-switch\" \"\$HOME/.local/bin/llm-switch\" \"\$HOME/.local/bin/flux-gen\" && \"$repo/tools/install-user-cli.sh\"")
+        cmds+=("rm -f \"\$HOME/.local/bin/docker-llm-switch\" \"\$HOME/.local/bin/llm-switch\" \"\$HOME/.local/bin/flux-gen\" \"\$HOME/.local/bin/tok-log\" && \"$repo/tools/install-user-cli.sh\"")
         ;;
     esac
   done
