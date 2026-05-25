@@ -1283,7 +1283,7 @@ def cmd_serve(args):
         def do_GET(self):
             parsed = urllib.parse.urlparse(self.path)
             path = parsed.path
-            qs = {k: v[0] for k, v in urllib.parse.parse_qs(parsed.query).items()}
+            qs = {k: v[0] for k, v in urllib.parse.parse_qs(parsed.query).items() if v}
             if path in ("/", "/index.html"):
                 return self._send_text(HTML)
             if path in API_ROUTES:
