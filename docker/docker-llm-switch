@@ -4,6 +4,8 @@
 #
 # Runtime commands:
 #   docker-llm-switch [coder|architect|gemma|vision|gptoss|imagine|comfyui]
+#   docker-llm-switch <slot> stop                  stop only that slot
+#   docker-llm-switch <slot> restart               recreate that slot (applies config changes)
 #   docker-llm-switch off
 #   docker-llm-switch status
 #   docker-llm-switch <slot> config               show tunable options + active overrides
@@ -15,8 +17,9 @@
 #   docker-llm-switch boot-default <slot>    set ONE slot to start at Docker daemon boot
 #   docker-llm-switch boot-status            show which slot will auto-start at boot
 #
-# Mutual exclusion: starting a slot stops every other spark-llm-* container first,
-# mirroring the systemd Conflicts= drop-ins from the POSTMORTEM hardening.
+# Mutual exclusion: starting a slot stops only weight-class conflicts
+# (heavyweight pairs are exclusive — POSTMORTEM); lightweights coexist.
+# See `Coexistence policy` in docker/README.md.
 #
 # Slot coverage: all seven slots are managed here — five llama.cpp slots
 # (coder/architect/gemma/vision/gptoss) share the spark-llm-stack image, plus
@@ -1068,12 +1071,48 @@ if is_slot "$CMD"; then
       handle_config "$CMD" "${@:3}"
       exit 0
       ;;
+    stop)
+      name=$(ctr_name "$CMD")
+      if [ "$(ctr_state "$name")" = "running" ]; then
+        echo "→ stopping $CMD"
+        docker stop "$name" >/dev/null && echo "  stopped"
+      else
+        echo "$CMD is not running"
+      fi
+      exit 0
+      ;;
+    restart)
+      # Recreate the slot's container with current config (including any
+      # `<slot> config` overrides) and preserve its existing restart policy
+      # so a boot-default slot stays a boot-default slot after restart.
+      # We skip the conflict/admission/cross-stack logic: this slot was
+      # already accounted for in memory, and we're not introducing a new
+      # one.
+      name=$(ctr_name "$CMD")
+      state=$(ctr_state "$name")
+      if [ "$state" = "absent" ]; then
+        echo "$CMD has no container to restart; use \`docker-llm-switch $CMD\` to start it." >&2
+        exit 1
+      fi
+      policy=$(ctr_restart_policy "$name")
+      echo "→ restarting $CMD"
+      [ "$state" = "running" ] && docker stop "$name" >/dev/null
+      ensure_absent "$name" || exit 1
+      if [ "$policy" = "unless-stopped" ]; then
+        docker_run_slot "$CMD" --restart unless-stopped
+      else
+        docker_run_slot "$CMD" --rm
+      fi
+      wait_ready "$CMD"
+      show_status
+      exit 0
+      ;;
     "")
       # fall through to start logic
       ;;
     *)
       echo "unknown subcommand for slot '$CMD': $SUBCMD" >&2
-      echo "valid subcommands: config" >&2
+      echo "valid subcommands: config | stop | restart" >&2
       exit 1
       ;;
   esac
@@ -1165,7 +1204,9 @@ case "$CMD" in
 docker-llm-switch — Docker-native llm-switch for DGX Spark GB10
 
 Runtime:
-  docker-llm-switch <slot>          start one slot (stops all others)
+  docker-llm-switch <slot>          start one slot (stops conflicting heavyweights only)
+  docker-llm-switch <slot> stop     stop just that slot, leave others running
+  docker-llm-switch <slot> restart  recreate that slot's container (applies any config changes)
   docker-llm-switch off             stop everything
   docker-llm-switch status          color-coded slot table with port + memory bars
   docker-llm-switch check           verify OOM failsafe + CLI tools are installed
