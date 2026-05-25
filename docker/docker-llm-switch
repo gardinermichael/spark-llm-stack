@@ -325,7 +325,9 @@ _apply_overrides() {
         break
       fi
     done
-    [ "$found" = "0" ] && _cmd+=("$flag" "$val")
+    if [ "$found" = "0" ]; then
+      _cmd+=("$flag" "$val")
+    fi
   done < "$conf"
 }
 
@@ -629,7 +631,7 @@ show_status() {
     printf "  %b%s%b\n" "$RED" "red=too large" "$NC"
   fi
 
-  # Compact health line — details via `docker-llm-switch check`.
+  # Compact health line — details via `docker-llm-switch health`.
   _status_health_line "$GRN" "$RED" "$NC"
   echo ""
 }
@@ -659,20 +661,36 @@ _status_health_line() {
   _chk "cli-tools"   "$(command -v docker-llm-switch llm-switch flux-gen >/dev/null 2>&1 && echo 1 || echo 0)"
 
   printf "  checks: %b  " "$out"
-  [ "$warn" -gt 0 ] && printf "(run 'docker-llm-switch check' for detail)\n" \
+  [ "$warn" -gt 0 ] && printf "(run 'docker-llm-switch health' for detail + fix)\n" \
                     || printf "\n"
 }
 
 # ── prerequisite checks ──────────────────────────────────────────────────────
 
-show_checks() {
-  local GRN=$'\033[0;32m' RED=$'\033[0;31m' YLW=$'\033[1;33m' BLD=$'\033[1m' NC=$'\033[0m'
-  [[ ! -t 1 ]] && GRN='' RED='' YLW='' BLD='' NC=''
+show_health() {
+  local GRN=$'\033[0;32m' RED=$'\033[0;31m' YLW=$'\033[1;33m' BLD=$'\033[1m' DIM=$'\033[2m' NC=$'\033[0m'
+  [[ ! -t 1 ]] && GRN='' RED='' YLW='' BLD='' DIM='' NC=''
 
+  # Track which remediations the failures imply, so we can offer them at the end.
+  # Use a plain list (not assoc array) to keep ordering deterministic.
+  local -a needs_remedies=()
+  _need() {
+    local r="$1" existing
+    for existing in "${needs_remedies[@]+"${needs_remedies[@]}"}"; do
+      [ "$existing" = "$r" ] && return 0
+    done
+    needs_remedies+=("$r")
+  }
+
+  local fail_count=0
   _row() {
     local label="$1" ok="$2" detail="$3"
     local mark color
-    if [ "$ok" = "1" ]; then mark="✓"; color="$GRN"; else mark="✗"; color="$RED"; fi
+    if [ "$ok" = "1" ]; then
+      mark="✓"; color="$GRN"
+    else
+      mark="✗"; color="$RED"; fail_count=$((fail_count + 1))
+    fi
     printf "  %b%s%b  %-22s  %s\n" "$color" "$mark" "$NC" "$label" "$detail"
   }
 
@@ -681,35 +699,152 @@ show_checks() {
   printf "  %s\n" "──────────────────────────────────────────────────────────"
 
   local earlyoom_state; earlyoom_state=$(systemctl is-active earlyoom 2>/dev/null || echo inactive)
-  _row "earlyoom" \
-    "$([ "$earlyoom_state" = active ] && echo 1 || echo 0)" \
-    "$earlyoom_state"
+  if [ "$earlyoom_state" = active ]; then
+    _row "earlyoom" 1 "$earlyoom_state"
+  else
+    _row "earlyoom" 0 "$earlyoom_state"
+    _need earlyoom-failsafe
+  fi
 
   local panic_path=/usr/local/bin/spark-panic
-  _row "spark-panic" \
-    "$([ -x "$panic_path" ] && echo 1 || echo 0)" \
-    "${panic_path}$([ -x "$panic_path" ] || echo '  (not found — run: sudo systemd/install-earlyoom-failsafe.sh)')"
+  if [ -x "$panic_path" ]; then
+    _row "spark-panic" 1 "$panic_path"
+  else
+    _row "spark-panic" 0 "$panic_path  (not found)"
+    _need earlyoom-failsafe
+  fi
 
-  _row "spark-mem.sh" \
-    "$([ -r "$SPARK_MEM_LIB" ] && echo 1 || echo 0)" \
-    "${SPARK_MEM_LIB}$([ -r "$SPARK_MEM_LIB" ] || echo '  (not found)')"
+  if [ -r "$SPARK_MEM_LIB" ]; then
+    _row "spark-mem.sh" 1 "$SPARK_MEM_LIB"
+  else
+    _row "spark-mem.sh" 0 "$SPARK_MEM_LIB  (not found)"
+    _need earlyoom-failsafe
+  fi
 
   local drop_ok=0
   sudo -ln 2>/dev/null | grep -q 'tee /proc/sys/vm/drop_caches' && drop_ok=1
-  _row "drop-caches sudo" "$drop_ok" \
-    "$([ "$drop_ok" = 1 ] && echo 'NOPASSWD rule present' || echo 'not configured — run: sudo systemd/install-drop-caches-sudoers.sh')"
+  if [ "$drop_ok" = 1 ]; then
+    _row "drop-caches sudo" 1 "NOPASSWD rule present"
+  else
+    _row "drop-caches sudo" 0 "not configured"
+    _need drop-caches-sudoers
+  fi
 
   echo ""
   printf "  %bCLI tools%b\n" "$BLD" "$NC"
   printf "  %s\n" "──────────────────────────────────────────────────────────"
 
+  local tool path
   for tool in docker-llm-switch llm-switch flux-gen; do
-    local path; path=$(command -v "$tool" 2>/dev/null || true)
-    _row "$tool" "$([ -n "$path" ] && echo 1 || echo 0)" \
-      "${path:-not in PATH — run: tools/install-user-cli.sh}"
+    path=$(command -v "$tool" 2>/dev/null || true)
+    if [ -n "$path" ]; then
+      _row "$tool" 1 "$path"
+    else
+      _row "$tool" 0 "not in PATH"
+      _need user-cli
+    fi
   done
 
   echo ""
+  if [ "$fail_count" -eq 0 ]; then
+    printf "  %ball checks passed%b\n\n" "$GRN" "$NC"
+    return 0
+  fi
+
+  printf "  %b%d check(s) failed.%b\n" "$YLW" "$fail_count" "$NC"
+  _offer_remediation "${needs_remedies[@]}"
+}
+
+# Locate the repo root so we can run install scripts that ship with it.
+# When this binary is symlinked into ~/.local/bin (the install-user-cli.sh
+# default), readlink -f resolves through the symlink back to the repo.
+# When it was copied (not symlinked), fall back to common locations.
+_repo_root() {
+  local script_dir candidate
+  script_dir=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
+  candidate="$(cd "$script_dir/.." && pwd)"
+  if [ -f "$candidate/systemd/install-earlyoom-failsafe.sh" ]; then
+    echo "$candidate"; return 0
+  fi
+  for candidate in "$HOME/Dev/spark-llm-stack" "$HOME/spark-llm-stack" "$HOME/src/spark-llm-stack"; do
+    if [ -f "$candidate/systemd/install-earlyoom-failsafe.sh" ]; then
+      echo "$candidate"; return 0
+    fi
+  done
+  return 1
+}
+
+_offer_remediation() {
+  local GRN=$'\033[0;32m' RED=$'\033[0;31m' YLW=$'\033[1;33m' BLD=$'\033[1m' DIM=$'\033[2m' NC=$'\033[0m'
+  [[ ! -t 1 ]] && GRN='' RED='' YLW='' BLD='' DIM='' NC=''
+
+  local repo
+  if ! repo=$(_repo_root); then
+    echo "  cannot locate the spark-llm-stack repo to run install scripts." >&2
+    echo "  expected one of: \$REPO/systemd/install-earlyoom-failsafe.sh" >&2
+    echo "  set SPARK_REPO=/path/to/spark-llm-stack and retry, or run the install scripts manually." >&2
+    return 1
+  fi
+
+  # Build the ordered command list.
+  local -a cmds=() labels=()
+  local r
+  for r in "$@"; do
+    case "$r" in
+      earlyoom-failsafe)
+        labels+=("OOM failsafe (earlyoom + spark-panic + spark-mem.sh)")
+        cmds+=("sudo $repo/systemd/install-earlyoom-failsafe.sh")
+        ;;
+      drop-caches-sudoers)
+        labels+=("drop-caches sudoers rule")
+        cmds+=("sudo $repo/systemd/install-drop-caches-sudoers.sh")
+        ;;
+      user-cli)
+        labels+=("user CLI symlinks (~/.local/bin)")
+        cmds+=("$repo/tools/install-user-cli.sh")
+        ;;
+    esac
+  done
+
+  echo ""
+  printf "  %bSuggested remediation:%b\n" "$BLD" "$NC"
+  local i
+  for i in "${!cmds[@]}"; do
+    printf "    %d. %s\n       %b%s%b\n" "$((i+1))" "${labels[$i]}" "$DIM" "${cmds[$i]}" "$NC"
+  done
+  echo ""
+
+  # Non-interactive: don't prompt, just show what to run.
+  if [[ ! -t 0 || ! -t 1 ]]; then
+    printf "  (non-interactive session — re-run \`docker-llm-switch health\` on a terminal to apply)\n\n"
+    return 0
+  fi
+
+  printf "  Run all of the above now? [y/N] "
+  local ans; read -r ans
+  case "$ans" in
+    y|Y|yes|YES)
+      echo ""
+      local rc=0
+      for i in "${!cmds[@]}"; do
+        printf "  %b→ %s%b\n" "$BLD" "${labels[$i]}" "$NC"
+        printf "    %s\n" "${cmds[$i]}"
+        if eval "${cmds[$i]}"; then
+          printf "  %bok%b\n\n" "$GRN" "$NC"
+        else
+          printf "  %bfailed (exit %d)%b\n\n" "$RED" "$?" "$NC"
+          rc=1
+        fi
+      done
+      printf "  re-checking…\n"
+      show_health
+      return $rc
+      ;;
+    *)
+      printf "  skipped — run the commands above when ready.\n\n"
+      return 0
+      ;;
+  esac
 }
 
 # ── live memory monitor ───────────────────────────────────────────────────────
@@ -1176,8 +1311,8 @@ case "$CMD" in
   status)
     show_status
     ;;
-  check|doctor)
-    show_checks
+  health|check|doctor)
+    show_health
     ;;
   memory)
     show_memory_watch
@@ -1209,7 +1344,8 @@ Runtime:
   docker-llm-switch <slot> restart  recreate that slot's container (applies any config changes)
   docker-llm-switch off             stop everything
   docker-llm-switch status          color-coded slot table with port + memory bars
-  docker-llm-switch check           verify OOM failsafe + CLI tools are installed
+  docker-llm-switch health          verify OOM failsafe + CLI tools, offer to fix anything failing
+                                    (aliases: check, doctor)
   docker-llm-switch memory          live memory monitor (Ctrl+C to exit)
 
 Runtime overrides (persisted across restarts):

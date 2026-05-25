@@ -483,6 +483,8 @@ docker-llm-switch <slot> stop               # stop only that slot, leave others 
 docker-llm-switch <slot> restart            # recreate that slot's container (picks up any config changes)
 docker-llm-switch off                       # stop everything
 docker-llm-switch panic                     # emergency: stop everything + drop caches
+docker-llm-switch health                    # verify OOM failsafe + CLI tools; offer to fix anything failing
+                                            #   (aliases: check, doctor)
 
 # Auto-start one slot when the Docker daemon starts
 docker-llm-switch boot-default architect    # only one slot ever has a restart policy
