@@ -478,6 +478,9 @@ tailscale ssh m@100.64.12.5      # raw tailnet IP also works
 ```bash
 docker-llm-switch status                    # slot table: port, memory bar, color-coded fit
 docker-llm-switch memory                    # live memory monitor (Ctrl+C to exit)
+docker-llm-switch usage                     # live token / throughput monitor (Ctrl+C to exit)
+                                            #   options: --interval N  --slot NAME  --json
+                                            #   aliases: tokens, top
 docker-llm-switch <slot>                    # start <slot> (stops conflicting heavyweights only — see Coexistence policy below)
 docker-llm-switch <slot> stop               # stop only that slot, leave others running
 docker-llm-switch <slot> restart            # recreate that slot's container (picks up any config changes)
