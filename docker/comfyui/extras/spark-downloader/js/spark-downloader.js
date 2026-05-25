@@ -1,19 +1,22 @@
 // spark-downloader frontend hook.
 //
-// ComfyUI core's Missing Models panel emits plain <a download href="...">
-// anchors with model URLs. With a remote browser those land in the
-// operator's local Downloads folder rather than ComfyUI's models/ tree.
+// ComfyUI core's Missing Models panel doesn't render anchors into the
+// document tree — it creates a transient <a> in a local variable, sets
+// href/download/target, calls .click() synchronously, then drops the
+// reference (see missingModelDownload-*.js -> downloadModel). The
+// browser handles the download via that synchronous click; the anchor
+// is never inserted, so a MutationObserver on document.body never sees
+// it.
 //
-// This script attaches a click handler to those anchors that POSTs to
-// our /spark/download_url backend instead, dropping the file directly
-// into models/<subdir>/. Subdir is inferred from filename tokens; the
-// backend re-validates the inference.
+// To intercept this we patch HTMLAnchorElement.prototype.click() once
+// at load time. The patch checks for an anchor with `download` set and
+// a model file extension on its href; if both match, it suppresses the
+// real click and POSTs to /spark/download_url instead. All other
+// clicks pass through untouched.
 //
-// We use a MutationObserver because the Missing Models panel is a React
-// component re-rendered on workflow load, and there's no public hook for
-// "before the panel renders". The observer is scoped to anchors with a
-// download attribute pointing at a model file extension, so the cost
-// across the rest of the UI is essentially nil.
+// A small bottom-right toast surfaces progress because the React
+// button has no awareness that we hijacked it — its own state won't
+// reflect what happened.
 
 import { app } from "../../scripts/app.js";
 
@@ -39,21 +42,65 @@ function guessSubdir(filename) {
 
 function basenameFromUrl(url) {
   try {
-    const u = new URL(url);
-    return decodeURIComponent(u.pathname.split("/").pop() || "");
+    return decodeURIComponent(new URL(url).pathname.split("/").pop() || "");
   } catch {
     return "";
   }
 }
 
-async function installServerSide(anchor) {
-  const url = anchor.href;
-  const filename = anchor.getAttribute("download") || basenameFromUrl(url);
+// ── toast container ─────────────────────────────────────────────────
+let toastBox = null;
+function ensureToastBox() {
+  if (toastBox && toastBox.isConnected) return toastBox;
+  toastBox = document.createElement("div");
+  toastBox.id = "spark-downloader-toasts";
+  Object.assign(toastBox.style, {
+    position: "fixed",
+    bottom: "16px",
+    right: "16px",
+    display: "flex",
+    flexDirection: "column",
+    gap: "8px",
+    zIndex: "999999",
+    pointerEvents: "none",
+    fontFamily: "system-ui, sans-serif",
+    fontSize: "13px",
+  });
+  document.body.appendChild(toastBox);
+  return toastBox;
+}
+
+function makeToast(text) {
+  const t = document.createElement("div");
+  Object.assign(t.style, {
+    background: "#1f2937",
+    color: "#e5e7eb",
+    padding: "10px 14px",
+    borderRadius: "8px",
+    boxShadow: "0 6px 20px rgba(0,0,0,0.4)",
+    maxWidth: "440px",
+    wordBreak: "break-all",
+    pointerEvents: "auto",
+    borderLeft: "3px solid #6b7280",
+  });
+  t.textContent = text;
+  ensureToastBox().appendChild(t);
+  return {
+    update(newText, color = null, border = null) {
+      t.textContent = newText;
+      if (color) t.style.color = color;
+      if (border) t.style.borderLeft = `3px solid ${border}`;
+    },
+    dismiss(after = 4000) {
+      setTimeout(() => t.remove(), after);
+    },
+  };
+}
+
+// ── installer ───────────────────────────────────────────────────────
+async function installServerSide(url, filename) {
   const subdir = guessSubdir(filename);
-  const original = anchor.textContent;
-  anchor.dataset.sparkBusy = "1";
-  anchor.style.pointerEvents = "none";
-  anchor.textContent = `Installing -> ${subdir}/${filename} ...`;
+  const toast = makeToast(`Installing → ${subdir}/${filename} …`);
   try {
     const r = await fetch("/spark/download_url", {
       method: "POST",
@@ -62,57 +109,48 @@ async function installServerSide(anchor) {
     });
     const j = await r.json().catch(() => ({}));
     if (r.ok) {
-      anchor.textContent =
+      const done =
         j.status === "already-present"
           ? `Already in ${subdir}/${filename}`
-          : `Installed -> ${subdir}/${filename}`;
-      anchor.style.color = "#7c7";
+          : `Installed → ${subdir}/${filename}`;
+      toast.update(done, "#bbf7d0", "#22c55e");
+      toast.dismiss(4000);
     } else {
-      anchor.textContent = `Failed: ${j.error || r.status} (click to retry)`;
-      anchor.style.color = "#e88";
-      anchor.style.pointerEvents = "";
-      delete anchor.dataset.sparkBusy;
+      toast.update(`Failed: ${j.error || r.status} — ${filename}`, "#fecaca", "#ef4444");
+      toast.dismiss(8000);
     }
   } catch (err) {
-    anchor.textContent = `Failed: ${err.message} (click to retry)`;
-    anchor.style.color = "#e88";
-    anchor.style.pointerEvents = "";
-    delete anchor.dataset.sparkBusy;
+    toast.update(`Failed: ${err.message} — ${filename}`, "#fecaca", "#ef4444");
+    toast.dismiss(8000);
   }
 }
 
-function hook(root) {
-  if (!root || !root.querySelectorAll) return;
-  const sel = "a[download][href]:not([data-spark-hooked])";
-  root.querySelectorAll(sel).forEach((a) => {
-    if (!MODEL_EXT_RE.test(a.href || "")) return;
-    a.dataset.sparkHooked = "1";
-    a.addEventListener(
-      "click",
-      async (e) => {
-        if (a.dataset.sparkBusy) return;
-        e.preventDefault();
-        e.stopPropagation();
-        await installServerSide(a);
-      },
-      true,
-    );
-  });
-}
+// ── click hook on HTMLAnchorElement ─────────────────────────────────
+const origClick = HTMLAnchorElement.prototype.click;
+HTMLAnchorElement.prototype.click = function patchedClick(...args) {
+  try {
+    const href = this.href || "";
+    const download = this.getAttribute("download") || this.download || "";
+    if (download && MODEL_EXT_RE.test(href)) {
+      const filename = download || basenameFromUrl(href);
+      installServerSide(href, filename);
+      return; // suppress the real navigation/download
+    }
+  } catch (e) {
+    // If anything goes wrong in the hook, fall through to native behavior
+    // rather than swallowing the user's click.
+    // eslint-disable-next-line no-console
+    console.warn("[spark-downloader] hook error, falling through", e);
+  }
+  return origClick.apply(this, args);
+};
 
 app.registerExtension({
   name: "spark.downloader",
   async setup() {
-    hook(document.body);
-    const observer = new MutationObserver((muts) => {
-      for (const m of muts) {
-        for (const n of m.addedNodes) {
-          if (n.nodeType === 1) hook(n);
-        }
-      }
-    });
-    observer.observe(document.body, { childList: true, subtree: true });
     // eslint-disable-next-line no-console
-    console.log("[spark-downloader] active — Missing Models anchors will install server-side");
+    console.log(
+      "[spark-downloader] active — anchor.click() patched; Missing Models downloads go server-side",
+    );
   },
 });
