@@ -1644,12 +1644,60 @@ if is_slot "$CMD"; then
       show_status
       exit 0
       ;;
+    logs)
+      # Convenience: tail the slot's container logs. Pass extra args
+      # straight through to `docker logs` (e.g. -f, --tail 200, --since 5m).
+      name=$(ctr_name "$CMD")
+      if [ "$(ctr_state "$name")" = "absent" ]; then
+        echo "$CMD has no container — nothing to show." >&2
+        echo "did it crash with --rm? next time start it with \`docker-llm-switch $CMD debug\` to preserve logs." >&2
+        exit 1
+      fi
+      exec docker logs "${@:3}" "$name"
+      ;;
+    debug)
+      # Start the slot WITHOUT --rm so the container (and its logs) survive
+      # a crash. Useful when llama-server SIGTRAPs / SIGABRTs / SIGSEGVs
+      # mid-request: with --rm, the corpse is gone before you can run
+      # `docker logs`. After the container exits, the body sticks around
+      # until you start the slot normally again (which calls ensure_absent).
+      target=$(ctr_name "$CMD")
+      echo "→ $CMD mode (${ROLES[$CMD]}) — DEBUG (no --rm; logs will survive a crash)"
+
+      if [ "$(ctr_state "$target")" = "running" ]; then
+        echo "  already running — \`docker-llm-switch $CMD stop\` first if you want a fresh debug start." >&2
+        exit 1
+      fi
+
+      spark_acquire_lock || exit 1
+      stop_conflicts "$CMD"
+      spark_drop_caches
+      projected_gb=$(spark_parse_gb "${MEMCAP[$CMD]}")
+      if ! spark_admission_check "$projected_gb"; then
+        echo "  insufficient memory for $CMD (${projected_gb}GiB cap); stopping cross-stack containers"
+        spark_cross_stack_stop_others "$target"
+      else
+        echo "  admission ok: ${projected_gb}GiB fits without stopping cross-stack containers"
+      fi
+
+      ensure_absent "$target" || exit 1
+      # Note the missing --rm.
+      docker_run_slot "$CMD"
+      wait_ready "$CMD"
+      echo ""
+      echo "→ following logs. Ctrl+C detaches; the container keeps running"
+      echo "  until it dies or you run \`docker-llm-switch $CMD stop\`."
+      echo "  after exit: \`docker-llm-switch $CMD logs --tail 200\`"
+      echo ""
+      # exec so signals (Ctrl+C) go directly to docker logs, not bash.
+      exec docker logs -f "$target"
+      ;;
     "")
       # fall through to start logic
       ;;
     *)
       echo "unknown subcommand for slot '$CMD': $SUBCMD" >&2
-      echo "valid subcommands: config | stop | restart" >&2
+      echo "valid subcommands: config | stop | restart | debug | logs" >&2
       exit 1
       ;;
   esac
@@ -1748,6 +1796,10 @@ Runtime:
   docker-llm-switch <slot>          start one slot (stops conflicting heavyweights only)
   docker-llm-switch <slot> stop     stop just that slot, leave others running
   docker-llm-switch <slot> restart  recreate that slot's container (applies any config changes)
+  docker-llm-switch <slot> debug    start the slot WITHOUT --rm so logs survive a crash;
+                                    follows logs live (Ctrl+C detaches, container keeps running)
+  docker-llm-switch <slot> logs …   shortcut for \`docker logs spark-llm-<slot>\`
+                                    (e.g. logs -f, logs --tail 200, logs --since 5m)
   docker-llm-switch off             stop everything
   docker-llm-switch status          color-coded slot table with port + memory bars
   docker-llm-switch health          verify OOM failsafe, CLI tools, and installed-file drift

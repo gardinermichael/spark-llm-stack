@@ -484,6 +484,9 @@ docker-llm-switch usage                     # live token / throughput monitor (C
 docker-llm-switch <slot>                    # start <slot> (stops conflicting heavyweights only — see Coexistence policy below)
 docker-llm-switch <slot> stop               # stop only that slot, leave others running
 docker-llm-switch <slot> restart            # recreate that slot's container (picks up any config changes)
+docker-llm-switch <slot> debug              # start the slot WITHOUT --rm so logs survive a crash;
+                                            #   follows logs live (Ctrl+C detaches, container keeps running)
+docker-llm-switch <slot> logs [docker args] # `docker logs spark-llm-<slot>` shortcut (e.g. -f, --tail 200)
 docker-llm-switch off                       # stop everything
 docker-llm-switch panic                     # emergency: stop everything + drop caches
 docker-llm-switch health                    # verify OOM failsafe, CLI tools, and installed-file drift
