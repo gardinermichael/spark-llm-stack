@@ -942,8 +942,8 @@ def _build_html():
 <html lang="en"><head><meta charset="utf-8">
 <title>tok-log</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/date-fns@2.30.0/index.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
+<link rel="icon" href="data:,">
 <style>
   :root {
     --bg:#0e1116; --fg:#e6edf3; --muted:#7d8590; --accent:#4493f8;
