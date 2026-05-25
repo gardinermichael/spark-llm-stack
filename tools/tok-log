@@ -1,0 +1,277 @@
+#!/usr/bin/env python3
+# tok-log — record llama-server token-speed benchmarks into SQLite.
+#
+# Usage:
+#   tok-log bench <slot> [--prompt "..."] [--n-predict 256] [--tag note]
+#   tok-log list  [--slot X] [--limit 20]
+#   tok-log show  <id>
+#   tok-log db-path
+#
+# Slots and ports mirror systemd/llm-switch :: PORTS. Keep in sync when
+# adding a slot (see CLAUDE.md "How slots are defined").
+#
+# Only llama-server slots are supported (coder/architect/gemma/vision/gptoss);
+# imagine + comfyui don't expose /completion timings.
+
+import argparse
+import json
+import os
+import sqlite3
+import sys
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+PORTS = {
+    "coder":     8152,
+    "architect": 8154,
+    "gemma":     8156,
+    "vision":    8155,
+    "gptoss":    8157,
+}
+
+DEFAULT_PROMPT = (
+    "Write a short technical explanation of how speculative decoding "
+    "improves throughput in transformer inference. Be concrete."
+)
+
+DB_PATH = Path(
+    os.environ.get("TOK_LOG_DB")
+    or (Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share"))
+        / "spark-llm-stack" / "token-speed.db")
+)
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS runs (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts                  TEXT    NOT NULL,
+    slot                TEXT    NOT NULL,
+    port                INTEGER NOT NULL,
+    host                TEXT    NOT NULL,
+    tag                 TEXT,
+    model_alias         TEXT,
+    model_path          TEXT,
+    n_ctx               INTEGER,
+    n_predict_req       INTEGER,
+    prompt_tokens       INTEGER,
+    predicted_tokens    INTEGER,
+    prompt_ms           REAL,
+    predicted_ms        REAL,
+    prompt_per_second   REAL,
+    predicted_per_second REAL,
+    wall_ms             REAL,
+    prompt              TEXT,
+    generation_settings TEXT,    -- json
+    props               TEXT,    -- json
+    timings             TEXT,    -- json (raw)
+    error               TEXT
+);
+CREATE INDEX IF NOT EXISTS runs_slot_ts ON runs (slot, ts DESC);
+"""
+
+
+def db_connect():
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.executescript(SCHEMA)
+    return conn
+
+
+def http_get_json(url, timeout=10):
+    with urllib.request.urlopen(url, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def http_post_json(url, payload, timeout=600):
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data, headers={"Content-Type": "application/json"}
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def cmd_bench(args):
+    if args.slot not in PORTS:
+        sys.exit(f"unknown slot {args.slot!r}; known: {', '.join(PORTS)}")
+    port = PORTS[args.slot]
+    host = args.host
+    base = f"http://{host}:{port}"
+
+    prompt = args.prompt or DEFAULT_PROMPT
+
+    try:
+        props = http_get_json(f"{base}/props", timeout=5)
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        sys.exit(f"server unreachable at {base}/props: {e}")
+
+    payload = {
+        "prompt": prompt,
+        "n_predict": args.n_predict,
+        "cache_prompt": False,
+        "stream": False,
+    }
+
+    t0 = time.monotonic()
+    err = None
+    resp = {}
+    try:
+        resp = http_post_json(f"{base}/completion", payload, timeout=args.timeout)
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"
+    wall_ms = (time.monotonic() - t0) * 1000.0
+
+    timings = resp.get("timings", {}) if isinstance(resp, dict) else {}
+    gen = resp.get("generation_settings", {}) if isinstance(resp, dict) else {}
+    model_path = props.get("model_path") or gen.get("model")
+    model_alias = (
+        gen.get("model_alias")
+        or props.get("default_generation_settings", {}).get("model_alias")
+        or props.get("model_alias")
+    )
+    n_ctx = (
+        gen.get("n_ctx")
+        or props.get("default_generation_settings", {}).get("n_ctx")
+        or props.get("n_ctx")
+    )
+
+    row = (
+        datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        args.slot, port, host, args.tag,
+        model_alias, model_path, n_ctx, args.n_predict,
+        timings.get("prompt_n"),
+        timings.get("predicted_n"),
+        timings.get("prompt_ms"),
+        timings.get("predicted_ms"),
+        timings.get("prompt_per_second"),
+        timings.get("predicted_per_second"),
+        wall_ms,
+        prompt,
+        json.dumps(gen, sort_keys=True) if gen else None,
+        json.dumps(props, sort_keys=True) if props else None,
+        json.dumps(timings, sort_keys=True) if timings else None,
+        err,
+    )
+
+    conn = db_connect()
+    with conn:
+        cur = conn.execute(
+            """INSERT INTO runs (
+                ts, slot, port, host, tag,
+                model_alias, model_path, n_ctx, n_predict_req,
+                prompt_tokens, predicted_tokens,
+                prompt_ms, predicted_ms,
+                prompt_per_second, predicted_per_second,
+                wall_ms, prompt, generation_settings, props, timings, error
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            row,
+        )
+        run_id = cur.lastrowid
+
+    if err:
+        print(f"[#{run_id}] {args.slot} ERROR: {err}")
+        sys.exit(1)
+
+    pps = timings.get("predicted_per_second")
+    pps_s = f"{pps:.2f} tok/s" if isinstance(pps, (int, float)) else "n/a"
+    prs = timings.get("prompt_per_second")
+    prs_s = f"{prs:.2f} tok/s" if isinstance(prs, (int, float)) else "n/a"
+    print(f"[#{run_id}] {args.slot}  model={model_alias or '?'}  "
+          f"predicted={timings.get('predicted_n')} @ {pps_s}  "
+          f"prompt={timings.get('prompt_n')} @ {prs_s}  "
+          f"wall={wall_ms:.0f}ms")
+
+
+def cmd_list(args):
+    conn = db_connect()
+    q = ("SELECT id, ts, slot, model_alias, prompt_tokens, predicted_tokens, "
+         "predicted_per_second, prompt_per_second, tag, error "
+         "FROM runs")
+    params = []
+    if args.slot:
+        q += " WHERE slot = ?"
+        params.append(args.slot)
+    q += " ORDER BY id DESC LIMIT ?"
+    params.append(args.limit)
+
+    rows = conn.execute(q, params).fetchall()
+    if not rows:
+        print("(no runs)")
+        return
+
+    print(f"  {'id':>4}  {'ts':<20}  {'slot':<10}  {'model':<28}  "
+          f"{'pp tok':>7}  {'gen tok':>7}  {'gen t/s':>8}  {'pp t/s':>8}  tag")
+    for r in rows:
+        rid, ts, slot, alias, pt, gt, pps, prs, tag, err = r
+        alias = (alias or "?")[:28]
+        tag = tag or ""
+        if err:
+            print(f"  {rid:>4}  {ts:<20}  {slot:<10}  {alias:<28}  "
+                  f"{'-':>7}  {'-':>7}  {'-':>8}  {'-':>8}  ERROR: {err}")
+            continue
+        pps_s = f"{pps:.1f}" if pps is not None else "-"
+        prs_s = f"{prs:.1f}" if prs is not None else "-"
+        print(f"  {rid:>4}  {ts:<20}  {slot:<10}  {alias:<28}  "
+              f"{(pt if pt is not None else '-'):>7}  "
+              f"{(gt if gt is not None else '-'):>7}  "
+              f"{pps_s:>8}  {prs_s:>8}  {tag}")
+
+
+def cmd_show(args):
+    conn = db_connect()
+    row = conn.execute("SELECT * FROM runs WHERE id = ?", (args.id,)).fetchone()
+    if not row:
+        sys.exit(f"no run with id {args.id}")
+    cols = [d[0] for d in conn.execute("SELECT * FROM runs WHERE id = ?",
+                                       (args.id,)).description]
+    for k, v in zip(cols, row):
+        if k in ("generation_settings", "props", "timings") and v:
+            try:
+                v = json.dumps(json.loads(v), indent=2, sort_keys=True)
+            except Exception:
+                pass
+            print(f"{k}:")
+            for line in str(v).splitlines():
+                print(f"  {line}")
+        else:
+            print(f"{k}: {v}")
+
+
+def cmd_db_path(_args):
+    print(DB_PATH)
+
+
+def main():
+    p = argparse.ArgumentParser(prog="tok-log",
+                                description="Record llama-server token-speed benchmarks to SQLite.")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    b = sub.add_parser("bench", help="run a benchmark prompt against a slot and log it")
+    b.add_argument("slot", help=f"one of: {', '.join(PORTS)}")
+    b.add_argument("--prompt", help="prompt text (default: built-in spec-decoding prompt)")
+    b.add_argument("--n-predict", type=int, default=256, help="tokens to generate (default 256)")
+    b.add_argument("--host", default="127.0.0.1")
+    b.add_argument("--timeout", type=int, default=600, help="request timeout seconds")
+    b.add_argument("--tag", help="free-form label (e.g. 'mtp-on', 'after-rebuild')")
+    b.set_defaults(func=cmd_bench)
+
+    l = sub.add_parser("list", help="show recent runs")
+    l.add_argument("--slot")
+    l.add_argument("--limit", type=int, default=20)
+    l.set_defaults(func=cmd_list)
+
+    s = sub.add_parser("show", help="dump a single run with full config")
+    s.add_argument("id", type=int)
+    s.set_defaults(func=cmd_show)
+
+    d = sub.add_parser("db-path", help="print the SQLite DB path")
+    d.set_defaults(func=cmd_db_path)
+
+    args = p.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
