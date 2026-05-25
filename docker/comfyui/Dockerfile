@@ -155,8 +155,14 @@ COPY --from=builder /build/ComfyUI /opt/ComfyUI
 # Default custom_nodes live OUTSIDE the bind-mount target so they don't
 # get shadowed when the user mounts ~/comfyui/custom_nodes over
 # /opt/ComfyUI/custom_nodes. entrypoint.sh seeds them on first run.
+# Manager's own pip deps (GitPython, uv, PyGithub, ...) must be installed
+# into /opt/venv or its prestartup import fails with `No module named
+# 'git'` and the Manager UI never registers — which makes the in-app
+# "Install Missing Models" button fall back to a plain browser download.
 RUN git clone --depth 1 https://github.com/ltdrdata/ComfyUI-Manager \
-      /opt/comfy-defaults/custom_nodes/ComfyUI-Manager
+      /opt/comfy-defaults/custom_nodes/ComfyUI-Manager \
+ && pip install --no-cache-dir -r \
+      /opt/comfy-defaults/custom_nodes/ComfyUI-Manager/requirements.txt
 
 COPY docker/comfyui/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
