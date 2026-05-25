@@ -247,16 +247,59 @@ Chronological record of what was tried on this host. Read this before trying
    `--kv-unified` and `--cache-reuse 1024` for now. Reasoning: FP16 KV is the
    highest-evidence community workaround (multiple independent reports of full
    stability); reducing draft horizon is the lowest-cost first lever.
-   Committed in `3b431a4`. **Verification pending on hardware.**
+   Committed in `3b431a4`.
 
-6. **Next step if step 5 fails:** drop `--cache-reuse 1024` and `--kv-unified`
-   per #23322's analysis of KV-reuse-across-SWA-slide as the trigger.
+5b. **First validation appeared to fail — but was a stale-binary artifact.**
+   `docker-llm-switch coder debug` showed the same CUDA crash at the first
+   checkpoint write (~31k tokens), and the boot log reported
+   `common_speculative_impl_draft_mtp: - n_max=5`. Checked
+   `docker-llm-switch coder config`: the `default` column for
+   `--spec-draft-n-max` displayed `5`, not `2`. The repo file at line 146
+   contained `--spec-draft-n-max 2`, but `~/.local/bin/docker-llm-switch` was
+   a stale `cp`'d copy from before the MTP edit. The `_cmd_default` helper
+   honestly reflected the binary's own embedded `CMD_coder` array — so the
+   table-vs-repo mismatch was the canary.
 
-7. **Next step after that:** add `--ctx-checkpoints 8` (down from 128).
+   **Lesson:** when a config change appears to have no runtime effect, run
+   `docker-llm-switch <slot> config` and compare the `default` column to the
+   committed `CMD_<slot>` in the repo. If they disagree, the installed binary
+   is stale. Fix: `rm -f ~/.local/bin/docker-llm-switch && tools/install-user-cli.sh`
+   to restore the symlink. The `health` subcommand should also catch this via
+   its `cmp -s` drift check — if it didn't, that's a bug worth filing.
 
-8. **Last resort:** disable MTP entirely (remove `--spec-type draft-mtp` and
-   the three `--spec-draft-*` flags). The only guaranteed fix. Loses ~30%
-   throughput on coder.
+6. **Re-validated (2026-05-25, after install-user-cli reinstall): stable.**
+   Coder survived a 30+ minute real coding workload past the 30k cliff with
+   the FP16+n_max=2 stack. **Throughput, however, dropped noticeably** —
+   FP16 KV roughly doubles KV bandwidth and n_max=2 cuts the speculative
+   batch size to <half of what n_max=5 produced.
+
+7. **Applied (2026-05-25): bumped `--spec-draft-n-max` 2 → 3 for throughput
+   recovery.** Lowest-risk lever for clawing back some t/s; community reports
+   suggest n_max=3 is commonly stable on Qwen3.6 (n_max=5 was the unsafe
+   default, not "anything above 2"). **Validation pending.**
+
+8. **Next perf lever if step 7 holds:** **hybrid KV — `-ctk f16 -ctv q8_0`.**
+   Rationale: the SWA/MTP chain in #23322 implicates the **K** cache (key
+   projections feed the embedding pre-norm that crashes). V is downstream
+   and less load-bearing. The dredyson writeup recommends "FP16 weights +
+   Q8 KV"; inverting it (FP16 K + Q8 V) keeps the protective half while
+   halving the extra KV memory and recovering some bandwidth. Risk: medium —
+   needs another long-workload validation. **Not yet tried.**
+
+9. **Next stability lever if MTP becomes unstable again:** drop `--kv-unified`
+   per #23322. Note: framing this as a *stability* lever, not a perf one —
+   at `--parallel 1` its perf impact is uncertain (could be neutral, slight
+   positive from less buffer-management overhead, or slight negative from
+   changed draft/target KV layout in MTP). Don't spend it for speed; save
+   it for stability.
+
+10. **Next step after that:** `--ctx-checkpoints 8` (down from 128) — fewer
+    checkpoints → less pool fragmentation per #23264. Costs prefix-reuse on
+    long sessions.
+
+11. **Last resort:** disable MTP entirely (remove `--spec-type draft-mtp` and
+    the three `--spec-draft-*` flags). The only guaranteed fix. Loses ~30%
+    throughput on coder.
 
 ## Lessons learned
 

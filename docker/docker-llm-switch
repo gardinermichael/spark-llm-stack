@@ -125,8 +125,11 @@ declare -A IMAGE=(
 
 # Qwen3.6-27B + MTP crashes with CUDA illegal-memory-access past ~30k ctx
 # (exitCode=133). Cross-engine bug, no upstream fix as of 2026-05-25.
-# Mitigation stack applied here: FP16 KV cache + --spec-draft-n-max 2.
-# If still unstable, next step is to drop --cache-reuse and --kv-unified.
+# Mitigation stack applied here: FP16 KV cache + --spec-draft-n-max 3
+# (validated stable at n_max=2 first; bumped to 3 for throughput).
+# If unstable, walk back to n_max=2, then drop --kv-unified, then drop
+# --cache-reuse, then disable MTP entirely. See gremlins doc for the full
+# ladder.
 # See: gremlins/02_QWEN36-27B-MTP-CUDA-CRASH.md
 #      https://github.com/vllm-project/vllm/issues/40756
 #      https://github.com/ggml-org/llama.cpp/issues/23322
@@ -143,7 +146,7 @@ CMD_coder=(
   --threads 16 --threads-batch 24 --threads-http 4
   --prio 3 --poll 100
   --spec-type draft-mtp
-  --spec-draft-n-max 2 --spec-draft-n-min 1 --spec-draft-p-min 0.75
+  --spec-draft-n-max 3 --spec-draft-n-min 1 --spec-draft-p-min 0.75
   --reasoning off --jinja
   --temp 0.6 --top-k 20 --top-p 0.95 --min-p 0.0
   --presence-penalty 0.0 --keep -1 --metrics --slots
