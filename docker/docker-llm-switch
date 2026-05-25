@@ -35,6 +35,19 @@ WAIT_TIMEOUT=300
 
 SLOTS=(coder architect gemma vision gptoss imagine comfyui)
 
+# Single source of truth for the user-shell CLI tools this script knows
+# about. Format: "name:relpath-from-repo-root". Consumed by the health
+# section (presence + drift + remediation). The repo-side installer
+# (`tools/install-user-cli.sh`) keeps its own copy; mismatches there will
+# show up as drift/missing rows in `health` output rather than silently
+# diverge.
+USER_CLI_TOOLS=(
+  "docker-llm-switch:docker/docker-llm-switch"
+  "llm-switch:systemd/llm-switch"
+  "flux-gen:tools/flux-gen"
+  "tok-log:tools/tok-log"
+)
+
 # ── config override storage ───────────────────────────────────────────────────
 # Per-slot overrides live in CONF_DIR/overrides/<slot>, one "flag=value" per line.
 # docker_run_slot applies these on top of the built-in CMD_<slot> arrays.
@@ -712,6 +725,45 @@ show_health() {
     printf "  %b%s%b  %-22s  %s\n" "$color" "$mark" "$NC" "$label" "$detail"
   }
 
+  # ── self-check ─────────────────────────────────────────────────────────
+  # Catch the "stale copy in ~/.local/bin shadows the repo symlink" trap
+  # (see gremlins/02_*.md troubleshooting log step 5b). This check is up
+  # top deliberately: it depends only on `command -v` and `readlink`, not
+  # on _repo_root or cmp, so it works even if the rest of show_health is
+  # stale. Running binary IS the artifact being audited — when the user
+  # later sees a fresh repo's checks, this row tells them whether the
+  # binary that produced the output is the one they think it is.
+  echo ""
+  printf "  %bSelf-check%b\n" "$BLD" "$NC"
+  printf "  %s\n" "──────────────────────────────────────────────────────────"
+
+  local path_dls; path_dls=$(command -v docker-llm-switch 2>/dev/null || true)
+  local running_dls; running_dls=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")
+  if [ -z "$path_dls" ]; then
+    _row "docker-llm-switch" 0 "not on PATH (running directly: $running_dls)"
+    _need user-cli
+  elif [ -L "$path_dls" ]; then
+    local link_target; link_target=$(readlink "$path_dls")
+    _row "docker-llm-switch" 1 "symlink → $link_target"
+  else
+    # Regular file at the PATH location: the exact handoff trap.
+    # `install-user-cli.sh` symlinks, so a regular file means either a
+    # manual `cp` (won't track future `git pull`s) or someone broke the
+    # symlink. Hard fail regardless of whether contents currently match.
+    _row "docker-llm-switch" 0 "regular file at $path_dls (NOT a symlink — won't track \`git pull\`)"
+    _need user-cli
+  fi
+
+  # If the running binary is different from what PATH resolves to, the
+  # user invoked us via an explicit path. Worth surfacing but not failing
+  # — they may have done it on purpose for debugging.
+  if [ -n "$path_dls" ] && [ -n "$running_dls" ]; then
+    local path_resolved; path_resolved=$(readlink -f "$path_dls" 2>/dev/null || echo "$path_dls")
+    if [ "$path_resolved" != "$running_dls" ]; then
+      _row "this invocation" 1 "running $running_dls (PATH would resolve to $path_resolved)"
+    fi
+  fi
+
   echo ""
   printf "  %bOOM failsafe%b\n" "$BLD" "$NC"
   printf "  %s\n" "──────────────────────────────────────────────────────────"
@@ -752,8 +804,9 @@ show_health() {
   printf "  %bCLI tools%b\n" "$BLD" "$NC"
   printf "  %s\n" "──────────────────────────────────────────────────────────"
 
-  local tool path
-  for tool in docker-llm-switch llm-switch flux-gen; do
+  local tool path entry
+  for entry in "${USER_CLI_TOOLS[@]}"; do
+    tool="${entry%%:*}"
     path=$(command -v "$tool" 2>/dev/null || true)
     if [ -n "$path" ]; then
       _row "$tool" 1 "$path"
@@ -771,16 +824,20 @@ show_health() {
   #   2. /usr/local/{lib,bin}/spark-{mem.sh,panic} are intentional copies
   #      installed by sudo; drift is content mismatch vs the repo source.
   local repo=""
-  if repo=$(_repo_root 2>/dev/null); then
-    echo ""
-    printf "  %bInstalled file sync%b  %b(repo: %s)%b\n" "$BLD" "$NC" "$DIM" "$repo" "$NC"
-    printf "  %s\n" "──────────────────────────────────────────────────────────"
+  echo ""
+  printf "  %bInstalled file sync%b\n" "$BLD" "$NC"
+  printf "  %s\n" "──────────────────────────────────────────────────────────"
+  if ! repo=$(_repo_root 2>/dev/null); then
+    # Silent skip used to live here — that hid the drift check entirely
+    # when the repo wasn't auto-discoverable. Now we emit an explicit
+    # failure row so the user knows checks were skipped, not passed.
+    _row "repo location" 0 "could not locate spark-llm-stack repo  (set SPARK_REPO=/path or run from \$HOME/Dev/spark-llm-stack)"
+    _need user-cli
+  else
+    printf "  %b(repo: %s)%b\n" "$DIM" "$repo" "$NC"
 
     local entry name rel dst src target
-    for entry in \
-        "docker-llm-switch:docker/docker-llm-switch" \
-        "llm-switch:systemd/llm-switch" \
-        "flux-gen:tools/flux-gen"; do
+    for entry in "${USER_CLI_TOOLS[@]}"; do
       name="${entry%%:*}"
       rel="${entry#*:}"
       dst="$HOME/.local/bin/$name"
@@ -827,6 +884,61 @@ show_health() {
       else
         _row "$name" 0 "out of sync with $src"
         _need earlyoom-failsafe
+      fi
+    done
+  fi
+
+  # ── token-speed logging ────────────────────────────────────────────────
+  # Verify the SQLite DB is writable and report which llama slots have a
+  # live watcher. A running slot without a watcher means missing log data
+  # but is recoverable (re-running `docker-llm-switch <slot>` respawns it
+  # from the idempotent path), so it's a warning row, not a hard fail.
+  echo ""
+  printf "  %bToken-speed logging%b\n" "$BLD" "$NC"
+  printf "  %s\n" "──────────────────────────────────────────────────────────"
+
+  # Prefer the canonical path tok-log itself reports, so renames/defaults
+  # there don't silently drift this check. Fall back to the same env-var
+  # resolution tok-log uses if the binary isn't on PATH.
+  local db_path tok_log
+  if tok_log=$(_find_tok_log); then
+    db_path=$("$tok_log" db-path 2>/dev/null || true)
+  fi
+  : "${db_path:=${TOK_LOG_DB:-${XDG_DATA_HOME:-$HOME/.local/share}/spark-llm-stack/token-speed.db}}"
+  local db_dir; db_dir=$(dirname "$db_path")
+  if mkdir -p "$db_dir" 2>/dev/null && [ -w "$db_dir" ]; then
+    if [ -e "$db_path" ]; then
+      if [ -w "$db_path" ]; then
+        local sz; sz=$(du -h "$db_path" 2>/dev/null | cut -f1)
+        _row "SQLite DB" 1 "$db_path  (${sz:-?})"
+      else
+        _row "SQLite DB" 0 "$db_path  (not writable)"
+      fi
+    else
+      _row "SQLite DB" 1 "$db_dir  (writable, db not yet created)"
+    fi
+  else
+    _row "SQLite DB" 0 "$db_dir  (cannot create or not writable)"
+  fi
+
+  if [ "${DOCKER_LLM_SWITCH_NO_WATCH:-0}" = "1" ]; then
+    _row "auto-watcher" 1 "disabled (DOCKER_LLM_SWITCH_NO_WATCH=1)"
+  else
+    local llama_slot ctr_state_v wpid pf
+    for llama_slot in "${SLOTS[@]}"; do
+      _is_watchable_slot "$llama_slot" || continue
+      ctr_state_v=$(ctr_state "$(ctr_name "$llama_slot")")
+      [ "$ctr_state_v" != "running" ] && continue
+      pf=$(_watcher_pid_file "$llama_slot")
+      if [ -f "$pf" ]; then
+        wpid=$(cat "$pf" 2>/dev/null)
+        if [ -n "$wpid" ] && kill -0 "$wpid" 2>/dev/null; then
+          _row "watcher ($llama_slot)" 1 "pid $wpid"
+        else
+          _row "watcher ($llama_slot)" 0 "stale pid file (pid $wpid gone)  → \`docker-llm-switch $llama_slot\` to respawn"
+        fi
+      else
+        _row "watcher ($llama_slot)" 0 "container running but no watcher  → \`docker-llm-switch $llama_slot\` to respawn"
       fi
     done
   fi
@@ -893,7 +1005,14 @@ _offer_remediation() {
         # drifted, so we clear them first and let the installer recreate
         # them as symlinks. `rm -f` is harmless on missing files and on
         # the symlinks the installer itself owns.
-        cmds+=("rm -f \"\$HOME/.local/bin/docker-llm-switch\" \"\$HOME/.local/bin/llm-switch\" \"\$HOME/.local/bin/flux-gen\" && \"$repo/tools/install-user-cli.sh\"")
+        # Build the rm -f list from USER_CLI_TOOLS so adding a new tool
+        # only requires editing the array at the top of this script.
+        local rm_paths="" tool_entry tool_name
+        for tool_entry in "${USER_CLI_TOOLS[@]}"; do
+          tool_name="${tool_entry%%:*}"
+          rm_paths+=" \"\$HOME/.local/bin/$tool_name\""
+        done
+        cmds+=("rm -f${rm_paths} && \"$repo/tools/install-user-cli.sh\"")
         ;;
     esac
   done
@@ -1682,17 +1801,28 @@ _spawn_watcher() {
     return 0  # already watching this slot
   fi
 
-  # Fully detach: nohup + setsid (if available) + redirect to log file.
+  # Detach via nohup (ignore SIGHUP, redirect IO to log file) + disown
+  # (remove from shell job table). NOT setsid: setsid forks to create the
+  # new session, so $! ends up pointing at the short-lived setsid parent
+  # rather than the actual worker — making the kill -0 sanity check below
+  # useless and _kill_watcher unable to find the real process later.
   # `tok-log watch` already self-terminates after --max-errors fetch failures.
-  if command -v setsid >/dev/null 2>&1; then
-    setsid nohup "$tok_log" watch "$slot" --interval "${TOK_LOG_INTERVAL:-10}" \
-      >>"$log_file" 2>&1 < /dev/null &
-  else
-    nohup "$tok_log" watch "$slot" --interval "${TOK_LOG_INTERVAL:-10}" \
-      >>"$log_file" 2>&1 < /dev/null &
+  local watcher_pid
+  nohup "$tok_log" watch "$slot" --interval "${TOK_LOG_INTERVAL:-10}" \
+    >>"$log_file" 2>&1 < /dev/null &
+  watcher_pid=$!
+  disown "$watcher_pid" 2>/dev/null || true
+  # Verify the spawn actually took. $! is reliable in normal cases but a
+  # broken tok-log (missing python, unwritable DB dir, syntax error) can
+  # exit before we'd notice — without this check we'd leave a stale pid
+  # file pointing at nothing and the next health run would flag a phantom.
+  sleep 0.05
+  if ! kill -0 "$watcher_pid" 2>/dev/null; then
+    echo "  watcher: spawn failed (pid $watcher_pid exited immediately; see $log_file)"
+    return 1
   fi
-  echo $! > "$pid_file"
-  echo "  watcher: pid $(cat "$pid_file") (log: $log_file)"
+  echo "$watcher_pid" > "$pid_file"
+  echo "  watcher: pid $watcher_pid (log: $log_file)"
 }
 
 _kill_watcher() {
