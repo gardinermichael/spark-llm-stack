@@ -560,17 +560,34 @@ This takes a while — it compiles SageAttention from source with `sm_121a` SASS
 
 **2. Put your models in `~/models/`**
 
-ComfyUI expects the standard subdirectory layout inside its `models/` folder.
-The container bind-mounts `~/models` → `/opt/ComfyUI/models`:
+ComfyUI expects the standard subdirectory layout inside its `models/`
+folder. The container bind-mounts `~/models` → `/opt/ComfyUI/models`:
 
 ```
 ~/models/
-  checkpoints/   ← diffusion models (.safetensors)
+  checkpoints/        ← classic SD-style checkpoints (.safetensors)
+  diffusion_models/   ← FLUX-style standalone diffusion weights
   vae/
-  clip/
+  text_encoders/      ← FLUX, SD3, Qwen, etc.
+  clip/               ← classic CLIP text encoders
   loras/
-  ...
+  controlnet/
+  upscale_models/
+  embeddings/
 ```
+
+If you want to share FLUX between the `imagine` slot (sd-server, which
+reads from `~/models/flux2-klein/…`) and the `comfyui` slot (which reads
+from the subdirs above), run the setup script with `--with-comfyui` — it
+creates every subdir and symlinks FLUX into each of `diffusion_models/`,
+`vae/`, and `text_encoders/` so a single 16 GB of weights serves both:
+
+```bash
+tools/setup-imagine.sh --with-comfyui
+```
+
+See [FLUX.2-klein model files](#flux2-klein-model-files) below for what
+the script actually does.
 
 **3. Start it**
 
@@ -617,39 +634,50 @@ overridden if your layout differs.
 
 ## FLUX.2-klein model files
 
+Use the installer script — it handles all four pieces (diffusion model,
+VAE, text-encoder shards, shard merge) and cleans up after itself:
+
 ```bash
-mkdir -p ~/models/flux2-klein
-
-# Main model (~8 GB, Apache 2.0)
-hf download black-forest-labs/FLUX.2-klein-4B \
-  flux-2-klein-4b.safetensors --local-dir ~/models/flux2-klein
-
-# VAE (~335 MB) — rename to ae.safetensors (path expected by docker-llm-switch)
-hf download Comfy-Org/flux2-dev \
-  split_files/vae/flux2-vae.safetensors --local-dir ~/models/flux2-klein && \
-  mv ~/models/flux2-klein/split_files/vae/flux2-vae.safetensors ~/models/flux2-klein/ae.safetensors
-
-# Text encoder shards (~8 GB total)
-hf download black-forest-labs/FLUX.2-klein-4B \
-  text_encoder/ --local-dir ~/models/flux2-klein
-
-# Merge shards into single file (required once; run from ~/models/flux2-klein).
-# Set PYTHON to any interpreter with safetensors+torch installed
-# (e.g. PYTHON=~/jupyterlab/.venv/bin/python3, or your own venv).
-cd ~/models/flux2-klein && "${PYTHON:-python3}" -c "
-from safetensors.torch import save_file, load_file
-base = 'text_encoder'
-s1 = load_file(f'{base}/model-00001-of-00002.safetensors')
-s2 = load_file(f'{base}/model-00002-of-00002.safetensors')
-save_file({**s1, **s2}, f'{base}/qwen_3_4b.safetensors')
-print('Done')
-"
+tools/setup-imagine.sh                  # FLUX only, into $MODELS_DIR/flux2-klein/
+tools/setup-imagine.sh --with-comfyui   # + ComfyUI subdir layout & symlinks
+MODELS_DIR=/data/models tools/setup-imagine.sh   # override target dir
 ```
 
+What it does (each step is skipped if its output already exists, so
+re-running is safe):
+
+1. **Diffusion model** — `flux-2-klein-4b.safetensors` (~8 GB, Apache 2.0)
+   from `black-forest-labs/FLUX.2-klein-4B`.
+2. **VAE** — downloads `split_files/vae/flux2-vae.safetensors` from
+   `Comfy-Org/flux2-dev`, moves it to `ae.safetensors` (the path
+   `docker-llm-switch`'s `--vae` flag points at), and removes the
+   leftover `split_files/` directory.
+3. **Text encoder** — downloads the two shards (~8 GB) and merges them
+   into `text_encoder/qwen_3_4b.safetensors`. Picks the first available
+   Python that has `safetensors+torch` importable (in order: `$PYTHON`,
+   `~/jupyterlab/.venv/bin/python3`, `python3`). If none is found, falls
+   back to `uv run --with safetensors --with torch` — uv caches the env
+   so the first run pays the install cost (~30 s) and subsequent runs
+   reuse it.
+4. **Cleanup** — deletes both shard files and `model.safetensors.index.json`
+   once the merge succeeds, reclaiming ~8 GB.
+
+Requirements: just [`uv`](https://docs.astral.sh/uv/) — the script
+bootstraps the `hf` CLI (via `uv tool run --from "huggingface_hub[cli]"`)
+when it's not on `PATH`, and uses `uv run --with` for the merge env.
+
 Notes:
-- `hf` replaces the deprecated `huggingface-cli`; both come from `pip install huggingface_hub[cli]` but older installs may still have only the old name.
-- `--local-dir-use-symlinks` was removed in newer `huggingface_hub` releases — `--local-dir` now always copies files directly.
-- The merge step needs `safetensors` + `torch`. Point `PYTHON` at any interpreter that has them installed, or set up a dedicated venv: `python3 -m venv ~/.venvs/flux && ~/.venvs/flux/bin/pip install safetensors torch && export PYTHON=~/.venvs/flux/bin/python3`.
+- `hf` replaces the deprecated `huggingface-cli`; if you'd rather install
+  it permanently, `uv tool install "huggingface_hub[cli]"`.
+- `--local-dir-use-symlinks` was removed in newer `huggingface_hub`
+  releases — `--local-dir` now always copies files directly, which is
+  why a manual `mv` is needed for the VAE.
+- bf16/fp16 dtypes are common in FLUX text encoders, and NumPy can't
+  represent bf16 — that's why the merge has to use `safetensors.torch`
+  rather than `safetensors.numpy`.
+
+If you'd rather do it by hand, the script's source under
+`tools/setup-imagine.sh` is short and readable.
 
 ---
 

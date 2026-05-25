@@ -495,38 +495,23 @@ cmake --build build --config Release -j20
 
 ### FLUX.2-klein model files (~17 GB total)
 
+Run the installer — it downloads all three artifacts (diffusion model,
+VAE, text-encoder shards), merges the shards into the single
+`qwen_3_4b.safetensors` the service unit expects, and deletes the
+redundant shard files afterwards. Idempotent; safe to re-run.
+
 ```bash
-mkdir -p ~/models/flux2-klein/text_encoder
-
-# Main model (~8 GB, Apache 2.0)
-hf download black-forest-labs/FLUX.2-klein-4B \
-  flux-2-klein-4b.safetensors --local-dir ~/models/flux2-klein
-
-# VAE (~335 MB)
-hf download Comfy-Org/flux2-dev \
-  split_files/vae/flux2-vae.safetensors --local-dir ~/models/flux2-klein
-
-# Text encoder shards (~8 GB total)
-hf download black-forest-labs/FLUX.2-klein-4B \
-  text_encoder/ --local-dir ~/models/flux2-klein
-
-# Merge shards into single file (required once; run from ~/models/flux2-klein).
-# Set PYTHON to any interpreter with safetensors+torch installed
-# (e.g. PYTHON=~/jupyterlab/.venv/bin/python3, or your own venv).
-cd ~/models/flux2-klein && "${PYTHON:-python3}" -c "
-from safetensors.torch import save_file, load_file
-base = 'text_encoder'
-s1 = load_file(f'{base}/model-00001-of-00002.safetensors')
-s2 = load_file(f'{base}/model-00002-of-00002.safetensors')
-save_file({**s1, **s2}, f'{base}/qwen_3_4b.safetensors')
-print('Done')
-"
+tools/setup-imagine.sh                  # → $MODELS_DIR/flux2-klein/ (default ~/models)
+tools/setup-imagine.sh --with-comfyui   # + ComfyUI subdir layout & symlinks
+MODELS_DIR=/data/models tools/setup-imagine.sh
 ```
 
-Notes:
-- `hf` replaces the deprecated `huggingface-cli`; both come from `pip install huggingface_hub[cli]` but older installs may still have only the old name.
-- `--local-dir-use-symlinks` was removed in newer `huggingface_hub` releases — `--local-dir` now always copies files directly.
-- The merge step needs `safetensors` + `torch`. Point `PYTHON` at any interpreter that has them installed, or set up a dedicated venv: `python3 -m venv ~/.venvs/flux && ~/.venvs/flux/bin/pip install safetensors torch && export PYTHON=~/.venvs/flux/bin/python3`.
+Only requirement is [`uv`](https://docs.astral.sh/uv/) — `hf` is run via
+`uv tool run` when absent, and the shard merge uses an existing Python
+that already has `safetensors+torch` if one is on `PATH`, falling back
+to a cached-ephemeral `uv run --with` env otherwise. See
+[`docker/README.md`](docker/README.md#flux2-klein-model-files) for the
+step-by-step breakdown.
 
 ---
 
