@@ -169,6 +169,12 @@ RUN git clone --depth 1 https://github.com/ltdrdata/ComfyUI-Manager \
  && pip install --no-cache-dir -r \
       /opt/comfy-defaults/custom_nodes/ComfyUI-Manager/requirements.txt
 
+# spark-downloader: server-side install for ComfyUI core's Missing Models
+# panel. Pure-Python backend + JS hook; reuses aiohttp + huggingface_hub
+# already installed in the image, no extra pip deps.
+COPY docker/comfyui/extras/spark-downloader \
+     /opt/comfy-defaults/custom_nodes/spark-downloader
+
 COPY docker/comfyui/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
