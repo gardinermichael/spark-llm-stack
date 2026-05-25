@@ -1,33 +1,37 @@
 #!/usr/bin/env bash
 # flux-gen — quick image generation from CLI
-# Usage: flux-gen "prompt" [width] [height] [steps] [seed]
-# Example: flux-gen "pixel art sword icon, white background" 512 512 4 42
+# Usage: flux-gen "prompt" [width] [height] [seed]
+# Example: flux-gen "pixel art sword icon, white background" 512 512 42
+#
+# Step count, sampler, and guidance are set server-side via sd-server
+# CLI flags (see docker/docker-llm-switch :: CMD_imagine), because the
+# OpenAI-compatible /v1/images/generations endpoint exposes no per-request
+# overrides for them.
 
 PROMPT="${1:-a beautiful landscape}"
 WIDTH="${2:-512}"
 HEIGHT="${3:-512}"
-STEPS="${4:-4}"
-SEED="${5:--1}"
+SEED="${4:--1}"
 BASE="${FLUX_HOST:-http://127.0.0.1:8160}"
 OUTDIR="$HOME/flux-output"
 mkdir -p "$OUTDIR"
 
-# Check server
-curl -sf "$BASE/sdcpp/v1/capabilities" > /dev/null 2>&1 || {
-  echo "FLUX server not running — start with: llm-switch imagine"
+# /v1/models is the OpenAI-shaped readiness probe; it stays available in
+# both native and Docker contexts (the older /sdcpp/v1/capabilities does
+# /proc/1/map_files introspection that ptrace-blocks inside containers).
+curl -sf "$BASE/v1/models" > /dev/null 2>&1 || {
+  echo "FLUX server not running — start with: llm-switch imagine  (or: docker-llm-switch imagine)"
   exit 1
 }
 
 echo "Generating: $PROMPT"
-echo "Size: ${WIDTH}x${HEIGHT}  Steps: $STEPS  Seed: $SEED"
+echo "Size: ${WIDTH}x${HEIGHT}  Seed: $SEED"
 
-# Pass values via argv so prompts containing quotes/newlines aren't interpolated
-# into Python source. Numeric values are parsed and bounds-checked in Python.
-python3 - "$BASE" "$PROMPT" "$WIDTH" "$HEIGHT" "$STEPS" "$SEED" "$OUTDIR" <<'PYEOF'
+python3 - "$BASE" "$PROMPT" "$WIDTH" "$HEIGHT" "$SEED" "$OUTDIR" <<'PYEOF'
 import sys, time, base64
 import requests
 
-base, prompt, width_s, height_s, steps_s, seed_s, outdir = sys.argv[1:8]
+base, prompt, width_s, height_s, seed_s, outdir = sys.argv[1:7]
 
 def parse_int(name, value, lo, hi):
     try:
@@ -40,48 +44,27 @@ def parse_int(name, value, lo, hi):
 
 width  = parse_int("width",  width_s,  64, 4096)
 height = parse_int("height", height_s, 64, 4096)
-steps  = parse_int("steps",  steps_s,   1, 200)
-# seed may be -1 (random) or any non-negative int
 seed   = parse_int("seed",   seed_s,   -1, 2**31 - 1)
 
 payload = {
     "prompt": prompt,
-    "width": width,
-    "height": height,
-    "batch_count": 1,
+    "size": f"{width}x{height}",
+    "n": 1,
     "seed": seed,
-    "sample_params": {
-        "sample_steps": steps,
-        "sample_method": "euler",
-        "guidance": {"txt_cfg": 1.0, "distilled_guidance": 3.5},
-    },
 }
 
-r = requests.post(f"{base}/sdcpp/v1/img_gen", json=payload)
-job = r.json()
-job_id = job["id"]
-print(f"Job: {job_id}")
-
 start = time.time()
-while True:
-    time.sleep(0.5)
-    r = requests.get(f"{base}/sdcpp/v1/jobs/{job_id}")
-    job = r.json()
-    status = job.get("status")
-    if status in ("completed", "failed", "cancelled"):
-        break
-
+r = requests.post(f"{base}/v1/images/generations", json=payload, timeout=600)
+r.raise_for_status()
+data = r.json().get("data", [])
 elapsed = time.time() - start
-if status == "completed":
-    images = job.get("result", {}).get("images", [])
-    if images:
-        img = base64.b64decode(images[0]["b64_json"])
-        fname = f"{outdir}/flux-{int(time.time())}.png"
-        with open(fname, "wb") as f:
-            f.write(img)
-        print(f"Done in {elapsed:.1f}s — {fname}  ({len(img)/1024:.0f}KB)")
-    else:
-        print("No images:", job.get("result"))
-else:
-    print(f"Failed: {job.get('error')}")
+
+if not data or "b64_json" not in data[0]:
+    sys.exit(f"flux-gen: unexpected response: {r.text[:300]}")
+
+img = base64.b64decode(data[0]["b64_json"])
+fname = f"{outdir}/flux-{int(time.time())}.png"
+with open(fname, "wb") as f:
+    f.write(img)
+print(f"Done in {elapsed:.1f}s — {fname}  ({len(img)/1024:.0f}KB)")
 PYEOF
