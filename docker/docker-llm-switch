@@ -712,6 +712,45 @@ show_health() {
     printf "  %b%s%b  %-22s  %s\n" "$color" "$mark" "$NC" "$label" "$detail"
   }
 
+  # ── self-check ─────────────────────────────────────────────────────────
+  # Catch the "stale copy in ~/.local/bin shadows the repo symlink" trap
+  # (see gremlins/02_*.md troubleshooting log step 5b). This check is up
+  # top deliberately: it depends only on `command -v` and `readlink`, not
+  # on _repo_root or cmp, so it works even if the rest of show_health is
+  # stale. Running binary IS the artifact being audited — when the user
+  # later sees a fresh repo's checks, this row tells them whether the
+  # binary that produced the output is the one they think it is.
+  echo ""
+  printf "  %bSelf-check%b\n" "$BLD" "$NC"
+  printf "  %s\n" "──────────────────────────────────────────────────────────"
+
+  local path_dls; path_dls=$(command -v docker-llm-switch 2>/dev/null || true)
+  local running_dls; running_dls=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")
+  if [ -z "$path_dls" ]; then
+    _row "docker-llm-switch" 0 "not on PATH (running directly: $running_dls)"
+    _need user-cli
+  elif [ -L "$path_dls" ]; then
+    local link_target; link_target=$(readlink "$path_dls")
+    _row "docker-llm-switch" 1 "symlink → $link_target"
+  else
+    # Regular file at the PATH location: the exact handoff trap.
+    # `install-user-cli.sh` symlinks, so a regular file means either a
+    # manual `cp` (won't track future `git pull`s) or someone broke the
+    # symlink. Hard fail regardless of whether contents currently match.
+    _row "docker-llm-switch" 0 "regular file at $path_dls (NOT a symlink — won't track \`git pull\`)"
+    _need user-cli
+  fi
+
+  # If the running binary is different from what PATH resolves to, the
+  # user invoked us via an explicit path. Worth surfacing but not failing
+  # — they may have done it on purpose for debugging.
+  if [ -n "$path_dls" ] && [ -n "$running_dls" ]; then
+    local path_resolved; path_resolved=$(readlink -f "$path_dls" 2>/dev/null || echo "$path_dls")
+    if [ "$path_resolved" != "$running_dls" ]; then
+      _row "this invocation" 1 "running $running_dls (PATH would resolve to $path_resolved)"
+    fi
+  fi
+
   echo ""
   printf "  %bOOM failsafe%b\n" "$BLD" "$NC"
   printf "  %s\n" "──────────────────────────────────────────────────────────"
@@ -771,10 +810,17 @@ show_health() {
   #   2. /usr/local/{lib,bin}/spark-{mem.sh,panic} are intentional copies
   #      installed by sudo; drift is content mismatch vs the repo source.
   local repo=""
-  if repo=$(_repo_root 2>/dev/null); then
-    echo ""
-    printf "  %bInstalled file sync%b  %b(repo: %s)%b\n" "$BLD" "$NC" "$DIM" "$repo" "$NC"
-    printf "  %s\n" "──────────────────────────────────────────────────────────"
+  echo ""
+  printf "  %bInstalled file sync%b\n" "$BLD" "$NC"
+  printf "  %s\n" "──────────────────────────────────────────────────────────"
+  if ! repo=$(_repo_root 2>/dev/null); then
+    # Silent skip used to live here — that hid the drift check entirely
+    # when the repo wasn't auto-discoverable. Now we emit an explicit
+    # failure row so the user knows checks were skipped, not passed.
+    _row "repo location" 0 "could not locate spark-llm-stack repo  (set SPARK_REPO=/path or run from \$HOME/Dev/spark-llm-stack)"
+    _need user-cli
+  else
+    printf "  %b(repo: %s)%b\n" "$DIM" "$repo" "$NC"
 
     local entry name rel dst src target
     for entry in \
