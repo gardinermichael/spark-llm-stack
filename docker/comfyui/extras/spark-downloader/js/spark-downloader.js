@@ -109,12 +109,21 @@ async function installServerSide(url, filename) {
     });
     const j = await r.json().catch(() => ({}));
     if (r.ok) {
-      const done =
-        j.status === "already-present"
-          ? `Already in ${subdir}/${filename}`
-          : `Installed → ${subdir}/${filename}`;
+      // The server may have reclassified the file by sniffing the
+      // safetensors header — surface the *final* subdir and note when
+      // it differed from the initial guess so the user sees the
+      // correction.
+      const finalSubdir = j.subdir || subdir;
+      let done;
+      if (j.status === "already-present") {
+        done = `Already in ${finalSubdir}/${filename}`;
+      } else if (j.reclassified) {
+        done = `Installed → ${finalSubdir}/${filename} (was guessed ${subdir})`;
+      } else {
+        done = `Installed → ${finalSubdir}/${filename}`;
+      }
       toast.update(done, "#bbf7d0", "#22c55e");
-      toast.dismiss(4000);
+      toast.dismiss(5000);
     } else {
       toast.update(`Failed: ${j.error || r.status} — ${filename}`, "#fecaca", "#ef4444");
       toast.dismiss(8000);
