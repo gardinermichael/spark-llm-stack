@@ -698,6 +698,7 @@ def cmd_watch(args):
 
     samples_written = 0
     last_was_error = False
+    consecutive_errors = 0
     try:
         while True:
             ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -716,6 +717,7 @@ def cmd_watch(args):
                 session_id, model_name = _discover_session(
                     args.slot, no_docker=args.no_docker, no_systemd=args.no_systemd)
             last_was_error = err is not None
+            consecutive_errors = consecutive_errors + 1 if err else 0
 
             row = {
                 "ts": ts, "slot": args.slot, "port": port, "host": host,
@@ -754,6 +756,10 @@ def cmd_watch(args):
                           f"predicted_t/s={pps_s}  processing={proc}")
 
             if args.samples and samples_written >= args.samples:
+                break
+            if args.max_errors and consecutive_errors >= args.max_errors:
+                if args.verbose:
+                    print(f"  giving up after {consecutive_errors} consecutive errors")
                 break
             time.sleep(args.interval)
     except KeyboardInterrupt:
@@ -859,6 +865,9 @@ def main():
     w.add_argument("--timeout", type=int, default=5)
     w.add_argument("--verbose", action="store_true",
                    help="print each sample as it's written")
+    w.add_argument("--max-errors", type=int, default=12,
+                   help="exit after N consecutive fetch failures (default 12 = ~2min "
+                        "at the default interval; 0 disables)")
     w.add_argument("--no-docker", action="store_true")
     w.add_argument("--no-systemd", action="store_true")
     w.set_defaults(func=cmd_watch)
