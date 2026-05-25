@@ -76,6 +76,7 @@ CREATE TABLE IF NOT EXISTS runs (
     port                INTEGER NOT NULL,
     host                TEXT    NOT NULL,
     tag                 TEXT,
+    session_id          TEXT,        -- container instance id (slot:cid:startedAt)
 
     -- model identity
     model_name          TEXT,        -- basename of -m, or value of -hf
@@ -136,6 +137,7 @@ CREATE TABLE IF NOT EXISTS runs (
 INDEXES = """
 CREATE INDEX IF NOT EXISTS runs_slot_ts        ON runs (slot, ts DESC);
 CREATE INDEX IF NOT EXISTS runs_model_name_ts  ON runs (model_name, ts DESC);
+CREATE INDEX IF NOT EXISTS runs_session        ON runs (session_id);
 """
 
 
@@ -146,6 +148,7 @@ def db_connect():
     # Forward-compat: if an older DB existed, add any missing columns.
     existing = {r[1] for r in conn.execute("PRAGMA table_info(runs)").fetchall()}
     wanted = {
+        "session_id": "TEXT",
         "model_name": "TEXT", "model_hf": "TEXT",
         "n_batch": "INTEGER", "n_ubatch": "INTEGER", "n_parallel": "INTEGER",
         "n_gpu_layers": "INTEGER", "flash_attn": "TEXT",
@@ -231,57 +234,74 @@ def parse_argv_to_flags(argv):
 
 
 def docker_inspect_cmd(slot):
+    """Return (argv, session_id) for the running container, or (None, None)."""
     if not shutil.which("docker"):
-        return None
+        return None, None
     name = f"{CONTAINER_PREFIX}{slot}"
     try:
         out = subprocess.run(
             ["docker", "inspect", "--format",
-             "{{json .Config.Entrypoint}}|{{json .Config.Cmd}}", name],
+             "{{json .Config.Entrypoint}}|{{json .Config.Cmd}}|"
+             "{{.Id}}|{{.State.StartedAt}}", name],
             capture_output=True, text=True, timeout=5, check=False,
         )
     except (subprocess.SubprocessError, FileNotFoundError):
-        return None
+        return None, None
     if out.returncode != 0:
-        return None
+        return None, None
     line = (out.stdout or "").strip()
-    if "|" not in line:
-        return None
-    ep_raw, cmd_raw = line.split("|", 1)
+    parts = line.split("|", 3)
+    if len(parts) < 4:
+        return None, None
+    ep_raw, cmd_raw, cid, started = parts
     try:
         ep = json.loads(ep_raw) or []
         cm = json.loads(cmd_raw) or []
     except json.JSONDecodeError:
-        return None
+        return None, None
     argv = list(ep) + list(cm)
-    return argv if argv else None
+    sess = f"{slot}:{cid[:12]}:{started}" if cid and started else None
+    return (argv if argv else None), sess
 
 
 def systemd_show_cmd(slot):
+    """Return (argv, session_id) for the running unit, or (None, None)."""
     unit = UNITS.get(slot)
     if not unit or not shutil.which("systemctl"):
-        return None
+        return None, None
     try:
         out = subprocess.run(
-            ["systemctl", "--user", "show", unit, "-p", "ExecStart"],
+            ["systemctl", "--user", "show", unit,
+             "-p", "ExecStart",
+             "-p", "MainPID",
+             "-p", "ActiveEnterTimestamp"],
             capture_output=True, text=True, timeout=5, check=False,
         )
     except (subprocess.SubprocessError, FileNotFoundError):
-        return None
+        return None, None
     if out.returncode != 0:
-        return None
-    # ExecStart=...{ path=<bin> ; argv[]=<bin> <arg1> <arg2> ... ; ...}
+        return None, None
     text = out.stdout or ""
+    # ExecStart=...{ path=<bin> ; argv[]=<bin> <arg1> <arg2> ... ; ...}
     marker = "argv[]="
     idx = text.find(marker)
-    if idx < 0:
-        return None
-    tail = text[idx + len(marker):]
-    end = tail.find(" ; ")
-    if end >= 0:
-        tail = tail[:end]
-    argv = tail.strip().split()
-    return argv or None
+    argv = None
+    if idx >= 0:
+        tail = text[idx + len(marker):]
+        end = tail.find(" ; ")
+        if end >= 0:
+            tail = tail[:end]
+        argv = tail.strip().split() or None
+
+    pid = ""
+    started = ""
+    for line in text.splitlines():
+        if line.startswith("MainPID="):
+            pid = line.split("=", 1)[1].strip()
+        elif line.startswith("ActiveEnterTimestamp="):
+            started = line.split("=", 1)[1].strip()
+    sess = f"{slot}:pid{pid}:{started}" if pid and pid != "0" else None
+    return argv, sess
 
 
 def load_overrides(slot):
@@ -327,15 +347,16 @@ def cmd_bench(args):
     except (urllib.error.URLError, TimeoutError, OSError) as e:
         sys.exit(f"server unreachable at {base}/props: {e}")
 
-    # Discover effective argv.
+    # Discover effective argv + session id.
     argv = None
+    session_id = None
     cmd_source = "none"
     if not args.no_docker:
-        argv = docker_inspect_cmd(args.slot)
+        argv, session_id = docker_inspect_cmd(args.slot)
         if argv:
             cmd_source = "docker"
     if argv is None and not args.no_systemd:
-        argv = systemd_show_cmd(args.slot)
+        argv, session_id = systemd_show_cmd(args.slot)
         if argv:
             cmd_source = "systemd"
 
@@ -387,6 +408,7 @@ def cmd_bench(args):
     row = {
         "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "slot": args.slot, "port": port, "host": host, "tag": args.tag,
+        "session_id": session_id,
 
         "model_name": model_name,
         "model_alias": model_alias,
@@ -479,7 +501,7 @@ def cmd_list(args):
     q = ("SELECT id, ts, slot, model_name, n_ctx, spec_draft_n_max, "
          "cache_type_k, cache_type_v, "
          "prompt_tokens, predicted_tokens, "
-         "predicted_per_second, prompt_per_second, tag, error "
+         "predicted_per_second, prompt_per_second, tag, session_id, error "
          "FROM runs")
     params = []
     wheres = []
@@ -487,6 +509,8 @@ def cmd_list(args):
         wheres.append("slot = ?"); params.append(args.slot)
     if args.model:
         wheres.append("model_name LIKE ?"); params.append(f"%{args.model}%")
+    if args.session:
+        wheres.append("session_id = ?"); params.append(args.session)
     if wheres:
         q += " WHERE " + " AND ".join(wheres)
     q += " ORDER BY id DESC LIMIT ?"
@@ -497,29 +521,37 @@ def cmd_list(args):
         print("(no runs)")
         return
 
-    print(f"  {'id':>4}  {'ts':<20}  {'slot':<10}  {'model':<32}  "
+    print(f"  {'id':>4}  {'ts':<20}  {'slot':<10}  {'model':<28}  "
           f"{'ctx':>6}  {'nmax':>4}  {'kv':<9}  "
-          f"{'pp tok':>7}  {'gen tok':>7}  {'gen t/s':>8}  {'pp t/s':>8}  tag")
+          f"{'pp tok':>7}  {'gen tok':>7}  {'gen t/s':>8}  {'pp t/s':>8}  "
+          f"{'sess':<14}  tag")
     for r in rows:
         (rid, ts, slot, model, ctx, nmax, ck, cv,
-         pt, gt, pps, prs, tag, err) = r
-        model = (model or "?")[:32]
+         pt, gt, pps, prs, tag, sess, err) = r
+        model = (model or "?")[:28]
         kv = f"{ck or '-'}/{cv or '-'}"[:9]
         tag = tag or ""
+        # Abbreviate session_id (slot:cid:ts → cid12) for display.
+        sess_short = "-"
+        if sess:
+            parts = sess.split(":")
+            sess_short = parts[1] if len(parts) >= 2 else sess[:12]
         if err:
-            print(f"  {rid:>4}  {ts:<20}  {slot:<10}  {model:<32}  "
+            print(f"  {rid:>4}  {ts:<20}  {slot:<10}  {model:<28}  "
                   f"{'-':>6}  {'-':>4}  {kv:<9}  "
-                  f"{'-':>7}  {'-':>7}  {'-':>8}  {'-':>8}  ERROR: {err}")
+                  f"{'-':>7}  {'-':>7}  {'-':>8}  {'-':>8}  "
+                  f"{sess_short:<14}  ERROR: {err}")
             continue
         pps_s = f"{pps:.1f}" if pps is not None else "-"
         prs_s = f"{prs:.1f}" if prs is not None else "-"
-        print(f"  {rid:>4}  {ts:<20}  {slot:<10}  {model:<32}  "
+        print(f"  {rid:>4}  {ts:<20}  {slot:<10}  {model:<28}  "
               f"{(ctx if ctx is not None else '-'):>6}  "
               f"{(nmax if nmax is not None else '-'):>4}  "
               f"{kv:<9}  "
               f"{(pt if pt is not None else '-'):>7}  "
               f"{(gt if gt is not None else '-'):>7}  "
-              f"{pps_s:>8}  {prs_s:>8}  {tag}")
+              f"{pps_s:>8}  {prs_s:>8}  "
+              f"{sess_short:<14}  {tag}")
 
 
 def cmd_show(args):
@@ -569,6 +601,7 @@ def main():
     l = sub.add_parser("list", help="show recent runs")
     l.add_argument("--slot")
     l.add_argument("--model", help="substring match on model_name")
+    l.add_argument("--session", help="exact match on session_id")
     l.add_argument("--limit", type=int, default=20)
     l.set_defaults(func=cmd_list)
 
