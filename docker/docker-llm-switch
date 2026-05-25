@@ -1068,9 +1068,36 @@ EOF
   for slot in "${active[@]}"; do errsince[$slot]="$watch_start"; done
 
   while true; do
+    # ── re-evaluate active slots each frame ───────────────────────────────
+    # Containers can exit mid-watch (OOM, crash, manual `<slot> stop`).
+    # We track who disappeared so we can log a synthetic "container
+    # exited" line into ERRORS instead of spewing "No such container"
+    # for every subsequent frame.
+    local -a prev_active=("${active[@]}")
+    active=()
+    for slot in "${SLOTS[@]}"; do
+      [ -n "$focus" ] && [ "$slot" != "$focus" ] && continue
+      case "$slot" in imagine|comfyui) continue ;; esac
+      local name; name=$(ctr_name "$slot")
+      [ "$(ctr_state "$name")" = "running" ] || continue
+      active+=("$slot")
+    done
+    # Surface running→absent transitions.
+    local hms_now; hms_now=$(date -u +%H:%M:%S)
+    local prev s still
+    for prev in "${prev_active[@]}"; do
+      still=0
+      for s in "${active[@]+"${active[@]}"}"; do
+        [ "$s" = "$prev" ] && still=1 && break
+      done
+      if [ "$still" = 0 ]; then
+        errors+=("[$prev $hms_now] container exited — check \`docker logs ${PREFIX}${prev}\`")
+      fi
+    done
+
     # Gather one frame's worth of samples first; render second.
     local -A cur=()
-    for slot in "${active[@]}"; do
+    for slot in "${active[@]+"${active[@]}"}"; do
       while IFS='=' read -r k v; do
         cur[${slot}_${k}]="$v"
       done < <(_usage_fetch "$slot")
@@ -1078,15 +1105,24 @@ EOF
 
     # ── gather new error log lines ────────────────────────────────────────
     # `docker logs -t --since <rfc3339>` returns only lines newer than the
-    # given timestamp, prefixed with their own RFC3339 timestamp. We
-    # filter by ERR_GREP, reformat the prefix, and append to the ring.
+    # given timestamp, prefixed with their own RFC3339 timestamp. We:
+    #   - re-confirm the container exists (race against exit between the
+    #     active-list rebuild above and this point);
+    #   - keep stderr from `docker logs` separate (the CLI emits "Error
+    #     response from daemon: …" there, which would otherwise be matched
+    #     by our ERR_GREP and surface as a fake container error);
+    #   - filter to lines beginning with an RFC3339 timestamp so anything
+    #     that slipped past the stderr split (e.g. "WARNING: …" preamble)
+    #     can't be mis-parsed.
     local next_since; next_since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-    for slot in "${active[@]}"; do
+    for slot in "${active[@]+"${active[@]}"}"; do
       local name; name=$(ctr_name "$slot")
+      [ "$(ctr_state "$name")" = "running" ] || continue
       local since="${errsince[$slot]:-$watch_start}"
       local raw
-      raw=$(docker logs -t --since "$since" "$name" 2>&1 \
-              | grep -iE "$ERR_GREP" 2>/dev/null || true)
+      raw=$(docker logs -t --since "$since" "$name" 2>/dev/null \
+              | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}T' \
+              | grep -iE "$ERR_GREP" || true)
       if [ -n "$raw" ]; then
         local line ts hms msg
         while IFS= read -r line; do
@@ -1096,13 +1132,13 @@ EOF
           hms=${ts#*T}; hms=${hms%%.*}; hms=${hms%Z}
           errors+=("[$slot $hms] $msg")
         done <<< "$raw"
-        # Trim to last MAX_ERR_LINES — newest at the tail.
-        if [ "${#errors[@]}" -gt "$MAX_ERR_LINES" ]; then
-          errors=("${errors[@]: -$MAX_ERR_LINES}")
-        fi
       fi
       errsince[$slot]="$next_since"
     done
+    # Trim to last MAX_ERR_LINES — newest at the tail.
+    if [ "${#errors[@]}" -gt "$MAX_ERR_LINES" ]; then
+      errors=("${errors[@]: -$MAX_ERR_LINES}")
+    fi
 
     # Render: home cursor, no clear (we erase-below at end to avoid flicker).
     printf '\033[H'
@@ -1117,7 +1153,11 @@ EOF
     printf "  %-11s %-6s  %-13s  %8s  %8s   %10s   %10s   %s\n" \
       "slot" ":port" "state" "+prompt" "+pred" "prompt t/s" "pred t/s" "KV used"
 
-    for slot in "${active[@]}"; do
+    if [ "${#active[@]}" -eq 0 ]; then
+      printf "  %b(no llama slots are currently running — \`docker-llm-switch <slot>\` to start one)%b\n" "$DIM" "$NC"
+    fi
+
+    for slot in "${active[@]+"${active[@]}"}"; do
       local port="${PORTS[$slot]}"
       local p_tok="${cur[${slot}_p_tok]:-}"
       local d_tok="${cur[${slot}_d_tok]:-}"
@@ -1164,7 +1204,7 @@ EOF
     printf "  %-11s  %14s  %14s   %12s   %12s   %s\n" \
       "slot" "prompt_total" "pred_total" "avg p t/s" "avg d t/s" "decodes"
 
-    for slot in "${active[@]}"; do
+    for slot in "${active[@]+"${active[@]}"}"; do
       local p_tok="${cur[${slot}_p_tok]:-0}"
       local d_tok="${cur[${slot}_d_tok]:-0}"
       local p_sec="${cur[${slot}_p_sec]:-0}"
