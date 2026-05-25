@@ -427,7 +427,7 @@ def cmd_bench(args):
         or props.get("default_generation_settings", {}).get("model_alias")
         or props.get("model_alias")
     )
-    if not model_name and model_path:
+    if not model_name and isinstance(model_path, str):
         model_name = os.path.basename(model_path)
 
     # n_ctx: prefer argv, then /props, then gen settings.
@@ -644,10 +644,12 @@ def parse_prometheus(text):
             continue
         # name{labels} value  OR  name value
         # Strip the label block if present (llamacpp doesn't use labels but
-        # be defensive).
-        if "{" in line:
-            head, _, rest = line.partition("{")
-            _, _, after = rest.partition("}")
+        # be defensive). Use split-on-first '{' and rsplit-on-last '}' so an
+        # embedded brace inside a quoted label value doesn't truncate the
+        # metric name.
+        if "{" in line and "}" in line:
+            head = line.split("{", 1)[0]
+            after = line.rsplit("}", 1)[-1]
             line = head + after
         parts = line.split()
         if len(parts) < 2:

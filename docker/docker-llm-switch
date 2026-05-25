@@ -1777,17 +1777,28 @@ _spawn_watcher() {
     return 0  # already watching this slot
   fi
 
-  # Fully detach: nohup + setsid (if available) + redirect to log file.
+  # Detach via nohup (ignore SIGHUP, redirect IO to log file) + disown
+  # (remove from shell job table). NOT setsid: setsid forks to create the
+  # new session, so $! ends up pointing at the short-lived setsid parent
+  # rather than the actual worker — making the kill -0 sanity check below
+  # useless and _kill_watcher unable to find the real process later.
   # `tok-log watch` already self-terminates after --max-errors fetch failures.
-  if command -v setsid >/dev/null 2>&1; then
-    setsid nohup "$tok_log" watch "$slot" --interval "${TOK_LOG_INTERVAL:-10}" \
-      >>"$log_file" 2>&1 < /dev/null &
-  else
-    nohup "$tok_log" watch "$slot" --interval "${TOK_LOG_INTERVAL:-10}" \
-      >>"$log_file" 2>&1 < /dev/null &
+  local watcher_pid
+  nohup "$tok_log" watch "$slot" --interval "${TOK_LOG_INTERVAL:-10}" \
+    >>"$log_file" 2>&1 < /dev/null &
+  watcher_pid=$!
+  disown "$watcher_pid" 2>/dev/null || true
+  # Verify the spawn actually took. $! is reliable in normal cases but a
+  # broken tok-log (missing python, unwritable DB dir, syntax error) can
+  # exit before we'd notice — without this check we'd leave a stale pid
+  # file pointing at nothing and the next health run would flag a phantom.
+  sleep 0.05
+  if ! kill -0 "$watcher_pid" 2>/dev/null; then
+    echo "  watcher: spawn failed (pid $watcher_pid exited immediately; see $log_file)"
+    return 1
   fi
-  echo $! > "$pid_file"
-  echo "  watcher: pid $(cat "$pid_file") (log: $log_file)"
+  echo "$watcher_pid" > "$pid_file"
+  echo "  watcher: pid $watcher_pid (log: $log_file)"
 }
 
 _kill_watcher() {
