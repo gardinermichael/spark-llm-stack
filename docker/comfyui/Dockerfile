@@ -80,10 +80,15 @@ RUN pip install -r requirements.txt
 # NVIDIA-backed DynamicVRAM allocator (aarch64 wheels on PyPI since 0.3.0).
 # ComfyUI auto-detects it; enables async weight offload + prevents memory
 # creep across workflow switches on unified memory.
-# Pinned exactly: matches the version cited by the research (Triplany /
-# RESEARCH.md §1 Finding 6). Bump deliberately after re-validating, not
-# via dependency drift.
-RUN pip install 'comfy-aimdo==0.3.0'
+#
+# Pinned to 0.4.5: ComfyUI master's comfy/model_management.py now calls
+# HostBuffer(0, 0, size, mark_cold=False) (4 args + kwarg). 0.3.0's
+# HostBuffer.__init__ only takes (size); running any workflow raises
+# `TypeError: HostBuffer.__init__() takes 2 positional arguments but 4
+# were given`. The 0.4.x API added prewarm/max_grow_size/mark_cold
+# parameters to match the new call site.
+# Bump deliberately after re-validating, not via dependency drift.
+RUN pip install 'comfy-aimdo==0.4.5'
 
 # Patch comfy/model_management.py for DGX Spark unified memory.
 #
