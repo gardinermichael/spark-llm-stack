@@ -1713,6 +1713,26 @@ if is_slot "$CMD"; then
       fi
       exec "$tok_log" bench "$CMD" "${@:3}"
       ;;
+    watch)
+      # Passively poll the slot's /metrics endpoint and append samples
+      # to SQLite. Llama slots only.
+      case "$CMD" in
+        imagine|comfyui)
+          echo "$CMD does not expose /metrics in the llamacpp shape — watch is for llama slots only." >&2
+          exit 1
+          ;;
+      esac
+      tok_log=$(_find_tok_log) || {
+        echo "tok-log not found. Install with: tools/install-user-cli.sh" >&2
+        exit 1
+      }
+      name=$(ctr_name "$CMD")
+      if [ "$(ctr_state "$name")" != "running" ]; then
+        echo "$CMD is not running — start it first with \`docker-llm-switch $CMD\`." >&2
+        exit 1
+      fi
+      exec "$tok_log" watch "$CMD" "${@:3}"
+      ;;
     debug)
       # Start the slot WITHOUT --rm so the container (and its logs) survive
       # a crash. Useful when llama-server SIGTRAPs / SIGABRTs / SIGSEGVs
@@ -1755,7 +1775,7 @@ if is_slot "$CMD"; then
       ;;
     *)
       echo "unknown subcommand for slot '$CMD': $SUBCMD" >&2
-      echo "valid subcommands: config | stop | restart | debug | logs | bench" >&2
+      echo "valid subcommands: config | stop | restart | debug | logs | bench | watch" >&2
       exit 1
       ;;
   esac
@@ -1878,9 +1898,14 @@ Runtime:
                                     benchmark the slot with a controlled prompt and
                                     log timings + effective argv + model to SQLite.
                                     Llama slots only (not imagine/comfyui).
-  docker-llm-switch log [list|show|db-path …]
+  docker-llm-switch <slot> watch [--interval 10 --samples N --verbose]
+                                    passively poll the slot's /metrics endpoint
+                                    and append samples to SQLite. Runs until
+                                    Ctrl+C (or --samples N).
+  docker-llm-switch log [list|samples|show|metrics|db-path …]
                                     inspect the token-speed log (default: \`list\`).
-                                    e.g. \`log list --slot coder\`, \`log show 42\`.
+                                    e.g. \`log list --slot coder\`, \`log show 42\`,
+                                    \`log samples --slot coder --limit 50\`.
   docker-llm-switch off             stop everything
   docker-llm-switch status          color-coded slot table with port + memory bars
   docker-llm-switch health          verify OOM failsafe, CLI tools, and installed-file drift

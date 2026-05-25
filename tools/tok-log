@@ -134,10 +134,43 @@ CREATE TABLE IF NOT EXISTS runs (
 );
 """
 
+SAMPLES_SCHEMA = """
+CREATE TABLE IF NOT EXISTS metrics_samples (
+    id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts                          TEXT    NOT NULL,
+    slot                        TEXT    NOT NULL,
+    port                        INTEGER NOT NULL,
+    host                        TEXT    NOT NULL,
+    session_id                  TEXT,
+    model_name                  TEXT,
+
+    -- llamacpp counters (cumulative since process start)
+    prompt_tokens_total         INTEGER,
+    predicted_tokens_total      INTEGER,
+    prompt_seconds_total        REAL,
+    predicted_seconds_total     REAL,
+    n_decode_total              INTEGER,
+
+    -- llamacpp gauges
+    prompt_tokens_per_second    REAL,
+    predicted_tokens_per_second REAL,
+    kv_cache_usage_ratio        REAL,
+    kv_cache_tokens             INTEGER,
+    requests_processing         INTEGER,
+    requests_deferred           INTEGER,
+    n_busy_slots_per_decode     REAL,
+
+    metrics_raw                 TEXT,   -- json map of every metric we saw
+    error                       TEXT
+);
+"""
+
 INDEXES = """
 CREATE INDEX IF NOT EXISTS runs_slot_ts        ON runs (slot, ts DESC);
 CREATE INDEX IF NOT EXISTS runs_model_name_ts  ON runs (model_name, ts DESC);
 CREATE INDEX IF NOT EXISTS runs_session        ON runs (session_id);
+CREATE INDEX IF NOT EXISTS samples_slot_ts     ON metrics_samples (slot, ts DESC);
+CREATE INDEX IF NOT EXISTS samples_session_ts  ON metrics_samples (session_id, ts DESC);
 """
 
 
@@ -145,6 +178,7 @@ def db_connect():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(DB_PATH))
     conn.executescript(SCHEMA)
+    conn.executescript(SAMPLES_SCHEMA)
     # Forward-compat: if an older DB existed, add any missing columns.
     existing = {r[1] for r in conn.execute("PRAGMA table_info(runs)").fetchall()}
     wanted = {
@@ -580,6 +614,209 @@ def cmd_db_path(_args):
     print(DB_PATH)
 
 
+# ── /metrics scraper (option 1: passive throughput logger) ────────────────────
+
+# Prometheus metric name → column name in metrics_samples. Anything in the
+# /metrics text not in this map still ends up in `metrics_raw` for forward
+# compatibility, but doesn't get a typed column.
+METRIC_COLUMNS = {
+    "llamacpp:prompt_tokens_total":         ("prompt_tokens_total", int),
+    "llamacpp:tokens_predicted_total":      ("predicted_tokens_total", int),
+    "llamacpp:prompt_seconds_total":        ("prompt_seconds_total", float),
+    "llamacpp:tokens_predicted_seconds_total": ("predicted_seconds_total", float),
+    "llamacpp:n_decode_total":              ("n_decode_total", int),
+    "llamacpp:prompt_tokens_seconds":       ("prompt_tokens_per_second", float),
+    "llamacpp:predicted_tokens_seconds":    ("predicted_tokens_per_second", float),
+    "llamacpp:kv_cache_usage_ratio":        ("kv_cache_usage_ratio", float),
+    "llamacpp:kv_cache_tokens":             ("kv_cache_tokens", int),
+    "llamacpp:requests_processing":         ("requests_processing", int),
+    "llamacpp:requests_deferred":           ("requests_deferred", int),
+    "llamacpp:n_busy_slots_per_decode":     ("n_busy_slots_per_decode", float),
+}
+
+
+def parse_prometheus(text):
+    """Return {metric_name: float_value}. Strips comments + labels."""
+    out = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        # name{labels} value  OR  name value
+        # Strip the label block if present (llamacpp doesn't use labels but
+        # be defensive).
+        if "{" in line:
+            head, _, rest = line.partition("{")
+            _, _, after = rest.partition("}")
+            line = head + after
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        name, value = parts[0], parts[-1]
+        try:
+            out[name] = float(value)
+        except ValueError:
+            continue
+    return out
+
+
+def fetch_metrics(host, port, timeout=5):
+    url = f"http://{host}:{port}/metrics"
+    with urllib.request.urlopen(url, timeout=timeout) as r:
+        return r.read().decode("utf-8")
+
+
+def _discover_session(slot, no_docker=False, no_systemd=False):
+    """Return (session_id, model_name) without re-running the bench parser."""
+    if not no_docker:
+        argv, sess = docker_inspect_cmd(slot)
+        if argv:
+            _, model_name, _, _ = parse_argv_to_flags(argv)
+            return sess, model_name
+    if not no_systemd:
+        argv, sess = systemd_show_cmd(slot)
+        if argv:
+            _, model_name, _, _ = parse_argv_to_flags(argv)
+            return sess, model_name
+    return None, None
+
+
+def cmd_watch(args):
+    if args.slot not in PORTS:
+        sys.exit(f"unknown slot {args.slot!r}; known: {', '.join(PORTS)}")
+    port = PORTS[args.slot]
+    host = args.host
+
+    # Discover session once; refresh only if we detect a restart (sample
+    # error then recovery is a cheap proxy for "container changed").
+    session_id, model_name = _discover_session(
+        args.slot, no_docker=args.no_docker, no_systemd=args.no_systemd)
+
+    conn = db_connect()
+    print(f"watching {args.slot} @ {host}:{port}  interval={args.interval}s  "
+          f"session={session_id or '?'}  (Ctrl+C to stop)")
+
+    samples_written = 0
+    last_was_error = False
+    try:
+        while True:
+            ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            err = None
+            raw = ""
+            metrics = {}
+            try:
+                raw = fetch_metrics(host, port, timeout=args.timeout)
+                metrics = parse_prometheus(raw)
+            except Exception as e:
+                err = f"{type(e).__name__}: {e}"
+
+            # If we recovered from an error, the container may have been
+            # restarted — re-discover the session.
+            if err is None and last_was_error:
+                session_id, model_name = _discover_session(
+                    args.slot, no_docker=args.no_docker, no_systemd=args.no_systemd)
+            last_was_error = err is not None
+
+            row = {
+                "ts": ts, "slot": args.slot, "port": port, "host": host,
+                "session_id": session_id, "model_name": model_name,
+                "metrics_raw": json.dumps(metrics, sort_keys=True) if metrics else None,
+                "error": err,
+            }
+            for metric_name, (col, conv) in METRIC_COLUMNS.items():
+                v = metrics.get(metric_name)
+                if v is None:
+                    row[col] = None
+                else:
+                    try:
+                        row[col] = conv(v)
+                    except (TypeError, ValueError):
+                        row[col] = None
+
+            cols = ", ".join(row.keys())
+            placeholders = ", ".join(["?"] * len(row))
+            with conn:
+                conn.execute(
+                    f"INSERT INTO metrics_samples ({cols}) VALUES ({placeholders})",
+                    list(row.values()),
+                )
+            samples_written += 1
+
+            if args.verbose:
+                if err:
+                    print(f"  {ts}  ERROR {err}")
+                else:
+                    pps = row.get("predicted_tokens_per_second")
+                    proc = row.get("requests_processing")
+                    pt = row.get("predicted_tokens_total")
+                    pps_s = f"{pps:.2f}" if isinstance(pps, (int, float)) else "-"
+                    print(f"  {ts}  predicted_total={pt}  "
+                          f"predicted_t/s={pps_s}  processing={proc}")
+
+            if args.samples and samples_written >= args.samples:
+                break
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        pass
+
+    print(f"\nwrote {samples_written} sample(s) to {DB_PATH}")
+
+
+def cmd_metrics(args):
+    """One-shot: fetch /metrics and print parsed values (no DB write)."""
+    if args.slot not in PORTS:
+        sys.exit(f"unknown slot {args.slot!r}; known: {', '.join(PORTS)}")
+    port = PORTS[args.slot]
+    raw = fetch_metrics(args.host, port, timeout=5)
+    metrics = parse_prometheus(raw)
+    if args.json:
+        print(json.dumps(metrics, indent=2, sort_keys=True))
+        return
+    for k in sorted(metrics):
+        print(f"  {k:<48}  {metrics[k]}")
+
+
+def cmd_samples(args):
+    conn = db_connect()
+    q = ("SELECT id, ts, slot, model_name, predicted_tokens_total, "
+         "predicted_tokens_per_second, requests_processing, "
+         "kv_cache_usage_ratio, session_id, error "
+         "FROM metrics_samples")
+    params, wheres = [], []
+    if args.slot:
+        wheres.append("slot = ?"); params.append(args.slot)
+    if args.session:
+        wheres.append("session_id = ?"); params.append(args.session)
+    if wheres:
+        q += " WHERE " + " AND ".join(wheres)
+    q += " ORDER BY id DESC LIMIT ?"
+    params.append(args.limit)
+    rows = conn.execute(q, params).fetchall()
+    if not rows:
+        print("(no samples)")
+        return
+    print(f"  {'id':>5}  {'ts':<20}  {'slot':<10}  {'model':<24}  "
+          f"{'pred tot':>10}  {'pred t/s':>9}  {'proc':>4}  {'kv%':>5}  sess")
+    for r in rows:
+        rid, ts, slot, model, pt, pps, proc, kv, sess, err = r
+        model = (model or "?")[:24]
+        sess_short = "-"
+        if sess:
+            parts = sess.split(":")
+            sess_short = parts[1] if len(parts) >= 2 else sess[:12]
+        if err:
+            print(f"  {rid:>5}  {ts:<20}  {slot:<10}  {model:<24}  "
+                  f"{'-':>10}  {'-':>9}  {'-':>4}  {'-':>5}  {sess_short}  ERROR: {err}")
+            continue
+        pps_s = f"{pps:.2f}" if pps is not None else "-"
+        kv_s = f"{kv*100:.1f}" if kv is not None else "-"
+        print(f"  {rid:>5}  {ts:<20}  {slot:<10}  {model:<24}  "
+              f"{(pt if pt is not None else '-'):>10}  "
+              f"{pps_s:>9}  "
+              f"{(proc if proc is not None else '-'):>4}  "
+              f"{kv_s:>5}  {sess_short}")
+
+
 def main():
     p = argparse.ArgumentParser(prog="tok-log",
                                 description="Record llama-server token-speed benchmarks to SQLite.")
@@ -611,6 +848,32 @@ def main():
 
     d = sub.add_parser("db-path", help="print the SQLite DB path")
     d.set_defaults(func=cmd_db_path)
+
+    w = sub.add_parser("watch", help="passively log /metrics samples to SQLite")
+    w.add_argument("slot", help=f"one of: {', '.join(PORTS)}")
+    w.add_argument("--interval", type=int, default=10,
+                   help="poll interval seconds (default 10)")
+    w.add_argument("--samples", type=int,
+                   help="stop after N samples (default: run until Ctrl+C)")
+    w.add_argument("--host", default="127.0.0.1")
+    w.add_argument("--timeout", type=int, default=5)
+    w.add_argument("--verbose", action="store_true",
+                   help="print each sample as it's written")
+    w.add_argument("--no-docker", action="store_true")
+    w.add_argument("--no-systemd", action="store_true")
+    w.set_defaults(func=cmd_watch)
+
+    m = sub.add_parser("metrics", help="one-shot fetch + parse of /metrics (no DB write)")
+    m.add_argument("slot", help=f"one of: {', '.join(PORTS)}")
+    m.add_argument("--host", default="127.0.0.1")
+    m.add_argument("--json", action="store_true", help="output as JSON")
+    m.set_defaults(func=cmd_metrics)
+
+    sa = sub.add_parser("samples", help="show recent /metrics samples")
+    sa.add_argument("--slot")
+    sa.add_argument("--session", help="exact match on session_id")
+    sa.add_argument("--limit", type=int, default=20)
+    sa.set_defaults(func=cmd_samples)
 
     args = p.parse_args()
     args.func(args)
