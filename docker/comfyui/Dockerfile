@@ -34,6 +34,11 @@ ARG SAGE_REPO=https://github.com/thu-ml/SageAttention
 # v2.2.0 — v3 has reported mosaic artifacts on GB10 (thu-ml/SageAttention#321).
 ARG SAGE_REF=v2.2.0
 ARG TORCH_VERSION=2.9.1
+# torchaudio/torchvision must match the torch minor version exactly — the
+# pytorch.org cu130 index now serves torchaudio 2.11.0 which references
+# torch 2.11 C++ symbols (undefined symbol: torch_library_impl on 2.9.x).
+ARG TORCHAUDIO_VERSION=2.9.1
+ARG TORCHVISION_VERSION=0.24.1
 ARG TORCH_INDEX=https://download.pytorch.org/whl/cu130
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -62,7 +67,9 @@ RUN python3.12 -m venv ${VENV} && \
 
 # PyTorch first so SageAttention links against the same ABI.
 RUN pip install --index-url ${TORCH_INDEX} \
-      torch==${TORCH_VERSION} torchvision torchaudio
+      torch==${TORCH_VERSION} \
+      torchvision==${TORCHVISION_VERSION} \
+      torchaudio==${TORCHAUDIO_VERSION}
 
 # ComfyUI itself — hard-fail on bad ref (same pattern as the llama Dockerfile).
 WORKDIR /build
@@ -109,6 +116,10 @@ PYEOF
 WORKDIR /build
 RUN git clone --depth 1 --branch ${SAGE_REF} ${SAGE_REPO} SageAttention
 WORKDIR /build/SageAttention
+# --no-build-isolation: SageAttention's setup.py does `import torch` at top
+# level, so the build backend must see the venv's torch. Without this flag
+# pip creates an isolated env that lacks torch and the build fails with
+# ModuleNotFoundError.
 RUN NVCC_APPEND_FLAGS="-gencode=arch=compute_121a,code=sm_121a" \
     pip install --no-build-isolation .
 

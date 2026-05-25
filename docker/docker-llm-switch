@@ -374,7 +374,13 @@ probe_ready() {
   local port="$1" slot="$2"
   case "$slot" in
     imagine)
-      curl -sf "http://127.0.0.1:$port/sdcpp/v1/capabilities" >/dev/null 2>&1
+      # /sdcpp/v1/capabilities reads /proc/1/map_files/* to introspect the
+      # binary, which is blocked inside Docker (yama ptrace + dropped
+      # CAP_SYS_PTRACE) — it returns HTTP 500 even when sd-server is fully
+      # loaded. /sdapi/v1/sd-models is the next-best signal: it 200s only
+      # once the model graph is constructed.
+      curl -sf "http://127.0.0.1:$port/sdapi/v1/sd-models" >/dev/null 2>&1 \
+        || curl -sf "http://127.0.0.1:$port/" >/dev/null 2>&1
       ;;
     comfyui)
       curl -sf "http://127.0.0.1:$port/system_stats" >/dev/null 2>&1
