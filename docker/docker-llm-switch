@@ -224,6 +224,13 @@ CMD_imagine=(
   --diffusion-fa
   --type f16
   --threads 16
+  # FLUX.2-klein is a 4-step distilled model: euler sampler, cfg-scale 1.0
+  # (uncond guidance off), distilled guidance 3.5. /v1/images/generations
+  # exposes no per-request overrides, so these must be server-side defaults.
+  --steps 4
+  --sampling-method euler
+  --cfg-scale 1.0
+  --guidance 3.5
 )
 
 # ComfyUI. Listen on 0.0.0.0 (host network), and the Grace-unified-memory

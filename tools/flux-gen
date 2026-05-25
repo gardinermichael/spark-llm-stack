@@ -1,33 +1,41 @@
 #!/usr/bin/env bash
 # flux-gen — quick image generation from CLI
-# Usage: flux-gen "prompt" [width] [height] [steps] [seed]
-# Example: flux-gen "pixel art sword icon, white background" 512 512 4 42
+# Usage: flux-gen "prompt" [width] [height] [seed]
+# Example: flux-gen "pixel art sword icon, white background" 512 512 42
+#
+# Step count, sampler, and guidance are set server-side via sd-server
+# CLI flags (see docker/docker-llm-switch :: CMD_imagine).
+#
+# Endpoint: /sdapi/v1/txt2img (Automatic1111 shape). The OpenAI shim
+# at /v1/images/generations silently ignores the `seed` field, so we
+# can't use it for reproducible / varied generations.
 
 PROMPT="${1:-a beautiful landscape}"
 WIDTH="${2:-512}"
 HEIGHT="${3:-512}"
-STEPS="${4:-4}"
-SEED="${5:--1}"
+SEED="${4:--1}"
 BASE="${FLUX_HOST:-http://127.0.0.1:8160}"
 OUTDIR="$HOME/flux-output"
 mkdir -p "$OUTDIR"
 
-# Check server
-curl -sf "$BASE/sdcpp/v1/capabilities" > /dev/null 2>&1 || {
-  echo "FLUX server not running — start with: llm-switch imagine"
+# /sdapi/v1/sd-models is the same probe docker-llm-switch's wait_ready
+# uses; 200s only once the model graph is loaded. Avoid the legacy
+# /sdcpp/v1/capabilities — it does /proc/1/map_files introspection
+# that ptrace-blocks inside Docker.
+curl -sf "$BASE/sdapi/v1/sd-models" > /dev/null 2>&1 || {
+  echo "FLUX server not running — start with: llm-switch imagine  (or: docker-llm-switch imagine)"
   exit 1
 }
 
 echo "Generating: $PROMPT"
-echo "Size: ${WIDTH}x${HEIGHT}  Steps: $STEPS  Seed: $SEED"
+echo "Size:  ${WIDTH}x${HEIGHT}"
+[ "$SEED" != "-1" ] && echo "Seed:  $SEED"
 
-# Pass values via argv so prompts containing quotes/newlines aren't interpolated
-# into Python source. Numeric values are parsed and bounds-checked in Python.
-python3 - "$BASE" "$PROMPT" "$WIDTH" "$HEIGHT" "$STEPS" "$SEED" "$OUTDIR" <<'PYEOF'
-import sys, time, base64
-import requests
+python3 - "$BASE" "$PROMPT" "$WIDTH" "$HEIGHT" "$SEED" "$OUTDIR" <<'PYEOF'
+import sys, time, json, base64, secrets
+from urllib import request, error
 
-base, prompt, width_s, height_s, steps_s, seed_s, outdir = sys.argv[1:8]
+base, prompt, width_s, height_s, seed_s, outdir = sys.argv[1:7]
 
 def parse_int(name, value, lo, hi):
     try:
@@ -40,48 +48,45 @@ def parse_int(name, value, lo, hi):
 
 width  = parse_int("width",  width_s,  64, 4096)
 height = parse_int("height", height_s, 64, 4096)
-steps  = parse_int("steps",  steps_s,   1, 200)
-# seed may be -1 (random) or any non-negative int
 seed   = parse_int("seed",   seed_s,   -1, 2**31 - 1)
 
-payload = {
+# sd-server's seed=-1 picks a "random" seed *once at server startup* and
+# reuses it forever — not what callers expect. Synthesize a fresh one
+# client-side so every default invocation varies, while explicit seeds
+# remain reproducible.
+if seed == -1:
+    seed = secrets.randbelow(2**31 - 1)
+    print(f"Seed:  {seed}  (random)")
+
+payload = json.dumps({
     "prompt": prompt,
     "width": width,
     "height": height,
-    "batch_count": 1,
     "seed": seed,
-    "sample_params": {
-        "sample_steps": steps,
-        "sample_method": "euler",
-        "guidance": {"txt_cfg": 1.0, "distilled_guidance": 3.5},
-    },
-}
+}).encode()
 
-r = requests.post(f"{base}/sdcpp/v1/img_gen", json=payload)
-job = r.json()
-job_id = job["id"]
-print(f"Job: {job_id}")
+req = request.Request(
+    f"{base}/sdapi/v1/txt2img",
+    data=payload,
+    headers={"content-type": "application/json"},
+    method="POST",
+)
 
 start = time.time()
-while True:
-    time.sleep(0.5)
-    r = requests.get(f"{base}/sdcpp/v1/jobs/{job_id}")
-    job = r.json()
-    status = job.get("status")
-    if status in ("completed", "failed", "cancelled"):
-        break
-
+try:
+    with request.urlopen(req, timeout=600) as resp:
+        body = json.loads(resp.read())
+except error.HTTPError as e:
+    sys.exit(f"flux-gen: HTTP {e.code}: {e.read()[:300].decode(errors='replace')}")
 elapsed = time.time() - start
-if status == "completed":
-    images = job.get("result", {}).get("images", [])
-    if images:
-        img = base64.b64decode(images[0]["b64_json"])
-        fname = f"{outdir}/flux-{int(time.time())}.png"
-        with open(fname, "wb") as f:
-            f.write(img)
-        print(f"Done in {elapsed:.1f}s — {fname}  ({len(img)/1024:.0f}KB)")
-    else:
-        print("No images:", job.get("result"))
-else:
-    print(f"Failed: {job.get('error')}")
+
+images = body.get("images") or []
+if not images:
+    sys.exit(f"flux-gen: unexpected response: {json.dumps(body)[:300]}")
+
+img = base64.b64decode(images[0])
+fname = f"{outdir}/flux-{int(time.time())}.png"
+with open(fname, "wb") as f:
+    f.write(img)
+print(f"Done in {elapsed:.1f}s — {fname}  ({len(img)/1024:.0f}KB)")
 PYEOF
