@@ -825,6 +825,493 @@ def cmd_samples(args):
               f"{kv_s:>5}  {sess_short}")
 
 
+# ── web UI (option: tok-log serve) ────────────────────────────────────────────
+
+def _rows_to_dicts(cursor):
+    cols = [d[0] for d in cursor.description]
+    return [dict(zip(cols, row)) for row in cursor.fetchall()]
+
+
+def _api_slots(conn, _qs):
+    cur = conn.execute(
+        "SELECT DISTINCT slot FROM ("
+        " SELECT slot FROM runs UNION SELECT slot FROM metrics_samples) "
+        "ORDER BY slot")
+    return [r[0] for r in cur.fetchall()]
+
+
+def _api_models(conn, _qs):
+    cur = conn.execute(
+        "SELECT DISTINCT model_name FROM ("
+        " SELECT model_name FROM runs WHERE model_name IS NOT NULL"
+        " UNION SELECT model_name FROM metrics_samples WHERE model_name IS NOT NULL) "
+        "ORDER BY model_name")
+    return [r[0] for r in cur.fetchall()]
+
+
+def _api_sessions(conn, qs):
+    where = ["session_id IS NOT NULL"]
+    params = []
+    if qs.get("slot"):
+        where.append("slot = ?"); params.append(qs["slot"])
+    if qs.get("model"):
+        where.append("model_name = ?"); params.append(qs["model"])
+    sql = ("SELECT session_id, slot, model_name, MIN(ts) AS first_ts, "
+           "MAX(ts) AS last_ts, COUNT(*) AS samples "
+           "FROM metrics_samples WHERE " + " AND ".join(where) +
+           " GROUP BY session_id ORDER BY last_ts DESC")
+    return _rows_to_dicts(conn.execute(sql, params))
+
+
+def _filter_where(qs, prefix=""):
+    """Build a WHERE clause and params from common filter keys."""
+    where, params = [], []
+    p = prefix
+    if qs.get("slot"):
+        where.append(f"{p}slot = ?"); params.append(qs["slot"])
+    if qs.get("model"):
+        where.append(f"{p}model_name = ?"); params.append(qs["model"])
+    if qs.get("session"):
+        where.append(f"{p}session_id = ?"); params.append(qs["session"])
+    if qs.get("tag"):
+        where.append(f"{p}tag = ?"); params.append(qs["tag"])
+    if qs.get("since"):
+        where.append(f"{p}ts >= ?"); params.append(qs["since"])
+    if qs.get("until"):
+        where.append(f"{p}ts <= ?"); params.append(qs["until"])
+    return where, params
+
+
+def _api_runs(conn, qs):
+    where, params = _filter_where(qs)
+    # tag/model/session/slot/ts all exist on runs; reuse the same builder.
+    sql = ("SELECT id, ts, slot, port, session_id, tag, model_name, model_alias, "
+           "n_ctx, n_batch, n_ubatch, n_parallel, n_gpu_layers, flash_attn, "
+           "cache_type_k, cache_type_v, cache_ram, cache_reuse, ctx_checkpoints, "
+           "kv_unified, spec_type, spec_draft_n_max, spec_draft_n_min, spec_draft_p_min, "
+           "threads, threads_batch, temp, top_k, top_p, min_p, "
+           "reasoning, reasoning_budget, reasoning_format, "
+           "n_predict_req, prompt_tokens, predicted_tokens, "
+           "prompt_ms, predicted_ms, prompt_per_second, predicted_per_second, "
+           "wall_ms, error "
+           "FROM runs")
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY id DESC LIMIT ?"
+    params.append(int(qs.get("limit", 200)))
+    return _rows_to_dicts(conn.execute(sql, params))
+
+
+def _api_run(conn, qs):
+    if "id" not in qs:
+        return {"error": "missing id"}
+    cur = conn.execute("SELECT * FROM runs WHERE id = ?", (int(qs["id"]),))
+    rows = _rows_to_dicts(cur)
+    return rows[0] if rows else {"error": "not found"}
+
+
+def _api_samples(conn, qs):
+    where, params = _filter_where(qs)
+    sql = ("SELECT id, ts, slot, session_id, model_name, "
+           "prompt_tokens_total, predicted_tokens_total, "
+           "prompt_seconds_total, predicted_seconds_total, "
+           "prompt_tokens_per_second, predicted_tokens_per_second, "
+           "kv_cache_usage_ratio, kv_cache_tokens, "
+           "requests_processing, requests_deferred, error "
+           "FROM metrics_samples")
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY id ASC LIMIT ?"
+    params.append(int(qs.get("limit", 5000)))
+    return _rows_to_dicts(conn.execute(sql, params))
+
+
+API_ROUTES = {
+    "/api/slots":    _api_slots,
+    "/api/models":   _api_models,
+    "/api/sessions": _api_sessions,
+    "/api/runs":     _api_runs,
+    "/api/run":      _api_run,
+    "/api/samples":  _api_samples,
+}
+
+
+def _build_html():
+    """Embedded single-page UI. Plain HTML + vanilla JS + Chart.js CDN."""
+    return r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<title>tok-log</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/date-fns@2.30.0/index.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
+<style>
+  :root {
+    --bg:#0e1116; --fg:#e6edf3; --muted:#7d8590; --accent:#4493f8;
+    --row:#161b22; --border:#30363d; --ok:#3fb950; --warn:#d29922; --err:#f85149;
+  }
+  * { box-sizing: border-box; }
+  body { background:var(--bg); color:var(--fg); font:13px/1.4 system-ui,-apple-system,sans-serif; margin:0; padding:16px; }
+  h1 { font-size:18px; margin:0 0 12px; }
+  h2 { font-size:14px; margin:16px 0 8px; color:var(--muted); font-weight:600; }
+  .filters { display:flex; gap:10px; flex-wrap:wrap; align-items:center; padding:10px; background:var(--row); border:1px solid var(--border); border-radius:6px; margin-bottom:14px; }
+  .filters label { color:var(--muted); }
+  select, input, button { background:var(--bg); color:var(--fg); border:1px solid var(--border); border-radius:4px; padding:4px 8px; font:inherit; }
+  button { cursor:pointer; }
+  button:hover { border-color:var(--accent); }
+  .tabs { display:flex; gap:2px; margin-bottom:12px; }
+  .tab { padding:6px 14px; background:var(--row); border:1px solid var(--border); border-bottom:none; border-radius:4px 4px 0 0; cursor:pointer; color:var(--muted); }
+  .tab.active { background:var(--bg); color:var(--fg); border-bottom:1px solid var(--bg); position:relative; top:1px; }
+  .panel { display:none; border:1px solid var(--border); border-radius:0 4px 4px 4px; padding:12px; min-height:400px; }
+  .panel.active { display:block; }
+  table { width:100%; border-collapse:collapse; font-size:12px; }
+  th, td { text-align:left; padding:5px 8px; border-bottom:1px solid var(--border); white-space:nowrap; }
+  th { color:var(--muted); font-weight:600; position:sticky; top:0; background:var(--bg); }
+  tbody tr { cursor:pointer; }
+  tbody tr:hover { background:var(--row); }
+  .num { text-align:right; font-variant-numeric:tabular-nums; }
+  .muted { color:var(--muted); }
+  .err { color:var(--err); }
+  .chip { background:var(--row); border:1px solid var(--border); border-radius:10px; padding:1px 8px; font-size:11px; }
+  .chart-wrap { position:relative; height:380px; }
+  #modal { position:fixed; inset:0; background:rgba(0,0,0,0.7); display:none; align-items:center; justify-content:center; z-index:99; }
+  #modal.show { display:flex; }
+  #modal .box { background:var(--bg); border:1px solid var(--border); border-radius:6px; padding:16px; max-width:90vw; max-height:88vh; overflow:auto; min-width:600px; }
+  #modal pre { font:11px/1.4 ui-monospace,monospace; white-space:pre-wrap; word-break:break-all; background:var(--row); padding:8px; border-radius:4px; max-height:300px; overflow:auto; }
+  .kv { display:grid; grid-template-columns:max-content 1fr; gap:2px 12px; font-family:ui-monospace,monospace; font-size:12px; }
+  .kv dt { color:var(--muted); }
+  .small { font-size:11px; }
+  #status { font-size:11px; color:var(--muted); margin-left:auto; }
+</style>
+</head>
+<body>
+<h1>tok-log <span class="muted" style="font-size:12px; font-weight:normal;">— token-speed dashboard</span></h1>
+
+<div class="filters">
+  <label>slot <select id="f-slot"><option value="">all</option></select></label>
+  <label>model <select id="f-model"><option value="">all</option></select></label>
+  <label>session <select id="f-session"><option value="">all</option></select></label>
+  <label>since <input id="f-since" type="datetime-local" style="width:200px"></label>
+  <label>until <input id="f-until" type="datetime-local" style="width:200px"></label>
+  <button id="f-clear">clear</button>
+  <button id="f-refresh">refresh</button>
+  <span id="status"></span>
+</div>
+
+<div class="tabs">
+  <div class="tab active" data-tab="runs">Bench runs</div>
+  <div class="tab" data-tab="timeline">Throughput timeline</div>
+  <div class="tab" data-tab="compare">Bench comparison</div>
+  <div class="tab" data-tab="kv">KV cache usage</div>
+</div>
+
+<div id="panel-runs" class="panel active">
+  <div class="muted small" style="margin-bottom:6px"><span id="runs-count">0</span> runs (click any row for full details)</div>
+  <div style="max-height:600px; overflow:auto">
+    <table id="runs-table">
+      <thead><tr>
+        <th>id</th><th>ts</th><th>slot</th><th>model</th><th>tag</th>
+        <th class="num">ctx</th><th class="num">n_max</th><th>kv</th>
+        <th class="num">gen tok</th><th class="num">gen t/s</th><th class="num">pp t/s</th>
+        <th>sess</th>
+      </tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</div>
+
+<div id="panel-timeline" class="panel">
+  <h2>predicted_tokens_per_second over time (per session)</h2>
+  <div class="chart-wrap"><canvas id="chart-timeline"></canvas></div>
+</div>
+
+<div id="panel-compare" class="panel">
+  <h2>average predicted_per_second from bench runs, grouped by:</h2>
+  <label>group by <select id="cmp-group">
+    <option value="tag">tag</option>
+    <option value="model_name">model</option>
+    <option value="spec_draft_n_max">spec_draft_n_max</option>
+    <option value="config">model + n_max + kv types</option>
+  </select></label>
+  <div class="chart-wrap" style="margin-top:10px"><canvas id="chart-compare"></canvas></div>
+</div>
+
+<div id="panel-kv" class="panel">
+  <h2>kv_cache_usage_ratio over time (per session)</h2>
+  <div class="chart-wrap"><canvas id="chart-kv"></canvas></div>
+</div>
+
+<div id="modal" onclick="if(event.target.id==='modal') this.classList.remove('show')">
+  <div class="box"><h2 id="m-title" style="margin-top:0"></h2><div id="m-body"></div></div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const fmt = (v, d=1) => v==null ? '—' : (typeof v === 'number' ? v.toFixed(d) : v);
+const fmtInt = v => v==null ? '—' : v;
+const palette = ['#4493f8','#3fb950','#d29922','#f85149','#a371f7','#db6d28','#39c5cf','#bf3989','#7d8590'];
+let charts = {};
+
+function toDbTs(v) {
+  // datetime-local emits `YYYY-MM-DDTHH:MM`; DB stores ISO text with offset.
+  return `${v}:00+00:00`;
+}
+
+function qs() {
+  const p = new URLSearchParams();
+  ['slot','model','session'].forEach(k => { const v = $(`f-${k}`).value; if (v) p.set(k, v); });
+  const s = $('f-since').value, u = $('f-until').value;
+  if (s) p.set('since', toDbTs(s));
+  if (u) p.set('until', toDbTs(u));
+  return p;
+}
+async function api(path, extra={}) {
+  const p = qs();
+  Object.entries(extra).forEach(([k,v]) => p.set(k,v));
+  const r = await fetch(`${path}?${p}`);
+  return r.json();
+}
+
+async function loadFilters() {
+  const [slots, models, sessions] = await Promise.all([
+    fetch('/api/slots').then(r=>r.json()),
+    fetch('/api/models').then(r=>r.json()),
+    fetch('/api/sessions').then(r=>r.json()),
+  ]);
+  for (const s of slots)  $('f-slot').insertAdjacentHTML('beforeend', `<option>${s}</option>`);
+  for (const m of models) $('f-model').insertAdjacentHTML('beforeend', `<option>${m}</option>`);
+  for (const r of sessions) {
+    const short = r.session_id.split(':')[1] || r.session_id.slice(0,12);
+    $('f-session').insertAdjacentHTML('beforeend',
+      `<option value="${r.session_id}">${r.slot}: ${short} (${r.samples} samples)</option>`);
+  }
+}
+
+async function loadRuns() {
+  const runs = await api('/api/runs', {limit: 500});
+  $('runs-count').textContent = runs.length;
+  const tb = document.querySelector('#runs-table tbody');
+  tb.innerHTML = runs.map(r => {
+    const sess = r.session_id ? (r.session_id.split(':')[1] || '') : '';
+    const kv = `${r.cache_type_k||'-'}/${r.cache_type_v||'-'}`;
+    const cls = r.error ? 'err' : '';
+    return `<tr data-id="${r.id}" class="${cls}">
+      <td>${r.id}</td><td>${r.ts}</td><td>${r.slot}</td>
+      <td>${r.model_name||'?'}</td><td>${r.tag||''}</td>
+      <td class="num">${fmtInt(r.n_ctx)}</td>
+      <td class="num">${fmtInt(r.spec_draft_n_max)}</td>
+      <td>${kv}</td>
+      <td class="num">${fmtInt(r.predicted_tokens)}</td>
+      <td class="num">${fmt(r.predicted_per_second,2)}</td>
+      <td class="num">${fmt(r.prompt_per_second,1)}</td>
+      <td class="small muted">${sess}</td>
+    </tr>`;
+  }).join('');
+  tb.querySelectorAll('tr').forEach(tr => tr.onclick = () => showRun(tr.dataset.id));
+}
+
+async function showRun(id) {
+  const r = await fetch(`/api/run?id=${id}`).then(x=>x.json());
+  $('m-title').textContent = `Run #${r.id} — ${r.slot} / ${r.model_name||'?'}`;
+  const kv = Object.entries(r).filter(([k,v]) => v != null
+    && !['cmd_argv','flags','overrides','generation_settings','props','timings','prompt'].includes(k))
+    .map(([k,v]) => `<dt>${k}</dt><dd>${typeof v==='string' && v.length>120 ? v.slice(0,120)+'…' : v}</dd>`).join('');
+  const blobs = ['flags','overrides','cmd_argv','timings','generation_settings','props']
+    .filter(k => r[k]).map(k => {
+      let v = r[k]; try { v = JSON.stringify(JSON.parse(v), null, 2); } catch(_) {}
+      return `<h2 style="margin-top:14px">${k}</h2><pre>${v}</pre>`;
+    }).join('');
+  const prompt = r.prompt ? `<h2 style="margin-top:14px">prompt</h2><pre>${r.prompt}</pre>` : '';
+  $('m-body').innerHTML = `<dl class="kv">${kv}</dl>${prompt}${blobs}`;
+  $('modal').classList.add('show');
+}
+
+function groupBy(arr, keyFn) {
+  const m = new Map();
+  for (const x of arr) {
+    const k = keyFn(x);
+    if (!m.has(k)) m.set(k, []);
+    m.get(k).push(x);
+  }
+  return m;
+}
+
+async function loadTimeline() {
+  const samples = await api('/api/samples', {limit: 20000});
+  const valid = samples.filter(s => s.error==null && s.predicted_tokens_per_second != null);
+  const bySession = groupBy(valid, s => s.session_id || 'unknown');
+  const datasets = [];
+  let i = 0;
+  for (const [sess, rows] of bySession) {
+    const short = (sess.split(':')[1] || sess.slice(0,12));
+    datasets.push({
+      label: `${rows[0].slot}: ${short}`,
+      data: rows.map(r => ({x: r.ts, y: r.predicted_tokens_per_second})),
+      borderColor: palette[i % palette.length],
+      backgroundColor: palette[i % palette.length] + '33',
+      pointRadius: 1, borderWidth: 1.5, tension: 0.2,
+    });
+    i++;
+  }
+  renderChart('chart-timeline', 'line', {datasets}, {
+    parsing: false,
+    scales: {x: {type:'time', time:{tooltipFormat:'PP HH:mm:ss'}},
+             y: {title:{display:true,text:'tokens/sec'}, beginAtZero:true}},
+  });
+}
+
+async function loadKV() {
+  const samples = await api('/api/samples', {limit: 20000});
+  const valid = samples.filter(s => s.error==null && s.kv_cache_usage_ratio != null);
+  const bySession = groupBy(valid, s => s.session_id || 'unknown');
+  const datasets = [];
+  let i = 0;
+  for (const [sess, rows] of bySession) {
+    const short = (sess.split(':')[1] || sess.slice(0,12));
+    datasets.push({
+      label: `${rows[0].slot}: ${short}`,
+      data: rows.map(r => ({x: r.ts, y: r.kv_cache_usage_ratio * 100})),
+      borderColor: palette[i % palette.length],
+      backgroundColor: palette[i % palette.length] + '33',
+      pointRadius: 1, borderWidth: 1.5, tension: 0.2, fill: false,
+    });
+    i++;
+  }
+  renderChart('chart-kv', 'line', {datasets}, {
+    parsing: false,
+    scales: {x: {type:'time'}, y:{min:0,max:100,title:{display:true,text:'KV cache used (%)'}}},
+  });
+}
+
+async function loadCompare() {
+  const runs = (await api('/api/runs', {limit: 2000})).filter(r => r.predicted_per_second != null);
+  const key = $('cmp-group').value;
+  const keyFn = key === 'config'
+    ? r => `${r.model_name||'?'} / n_max=${r.spec_draft_n_max} / ${r.cache_type_k||'-'}/${r.cache_type_v||'-'}`
+    : r => String(r[key] ?? '(null)');
+  const groups = groupBy(runs, keyFn);
+  const labels = [...groups.keys()];
+  const avg = labels.map(k => {
+    const xs = groups.get(k).map(r => r.predicted_per_second);
+    return xs.reduce((a,b)=>a+b,0) / xs.length;
+  });
+  const counts = labels.map(k => groups.get(k).length);
+  renderChart('chart-compare', 'bar', {
+    labels,
+    datasets: [{
+      label: 'avg predicted_per_second',
+      data: avg,
+      backgroundColor: labels.map((_,i)=>palette[i%palette.length]),
+    }],
+  }, {
+    scales: {y: {title:{display:true,text:'tokens/sec'}, beginAtZero:true}},
+    plugins: {tooltip: {callbacks: {afterLabel: ctx => `n = ${counts[ctx.dataIndex]}`}}},
+  });
+}
+
+function renderChart(id, type, data, options={}) {
+  if (charts[id]) charts[id].destroy();
+  charts[id] = new Chart($(id), {type, data, options: {
+    responsive: true, maintainAspectRatio: false,
+    plugins: {legend: {labels: {color:'#e6edf3'}}, ...(options.plugins||{})},
+    scales: Object.fromEntries(Object.entries(options.scales||{}).map(([k,v]) =>
+      [k, {...v, ticks:{color:'#7d8590'}, grid:{color:'#30363d'}, title:{...(v.title||{}), color:'#7d8590'}}]
+    )),
+    ...Object.fromEntries(Object.entries(options).filter(([k]) => !['plugins','scales'].includes(k))),
+  }});
+}
+
+// Time-axis support without a CDN dep: convert timestamps to Date objects.
+const _origLine = Chart.controllers ? null : null;
+
+async function refreshAll() {
+  $('status').textContent = 'loading…';
+  try {
+    await Promise.all([loadRuns(), loadTimeline(), loadCompare(), loadKV()]);
+    $('status').textContent = 'updated ' + new Date().toLocaleTimeString();
+  } catch (e) {
+    $('status').textContent = 'error: ' + e.message;
+  }
+}
+
+document.querySelectorAll('.tab').forEach(t => t.onclick = () => {
+  document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
+  document.querySelectorAll('.panel').forEach(x => x.classList.remove('active'));
+  t.classList.add('active');
+  $('panel-' + t.dataset.tab).classList.add('active');
+});
+$('f-clear').onclick = () => { ['slot','model','session'].forEach(k => $(`f-${k}`).value=''); $('f-since').value=''; $('f-until').value=''; refreshAll(); };
+$('f-refresh').onclick = refreshAll;
+['f-slot','f-model','f-session','f-since','f-until'].forEach(id => $(id).onchange = refreshAll);
+$('cmp-group').onchange = loadCompare;
+
+(async () => { await loadFilters(); await refreshAll(); })();
+</script>
+</body></html>
+"""
+
+
+def cmd_serve(args):
+    import http.server
+    import urllib.parse
+    from socketserver import ThreadingMixIn
+
+    HTML = _build_html()
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, fmt, *a):
+            if args.verbose:
+                sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % a))
+
+        def _send_json(self, obj, code=200):
+            body = json.dumps(obj, default=str).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _send_text(self, text, ctype="text/html; charset=utf-8", code=200):
+            body = text.encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            parsed = urllib.parse.urlparse(self.path)
+            path = parsed.path
+            qs = {k: v[0] for k, v in urllib.parse.parse_qs(parsed.query).items() if v}
+            if path in ("/", "/index.html"):
+                return self._send_text(HTML)
+            if path in API_ROUTES:
+                conn = db_connect()
+                try:
+                    result = API_ROUTES[path](conn, qs)
+                except Exception as e:
+                    return self._send_json({"error": f"{type(e).__name__}: {e}"}, 500)
+                finally:
+                    conn.close()
+                return self._send_json(result)
+            self._send_text("404", "text/plain", 404)
+
+    class ThreadingServer(ThreadingMixIn, http.server.HTTPServer):
+        daemon_threads = True
+
+    server = ThreadingServer((args.host, args.port), Handler)
+    url = f"http://{args.host}:{args.port}"
+    print(f"tok-log serve: {url}  (db: {DB_PATH})")
+    print("Ctrl+C to stop.")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+
+
 def main():
     p = argparse.ArgumentParser(prog="tok-log",
                                 description="Record llama-server token-speed benchmarks to SQLite.")
@@ -885,6 +1372,14 @@ def main():
     sa.add_argument("--session", help="exact match on session_id")
     sa.add_argument("--limit", type=int, default=20)
     sa.set_defaults(func=cmd_samples)
+
+    sv = sub.add_parser("serve", help="start the web UI over the SQLite log")
+    sv.add_argument("--host", default="127.0.0.1",
+                    help="bind address (default 127.0.0.1; use 0.0.0.0 for LAN/Tailscale)")
+    sv.add_argument("--port", type=int, default=8765,
+                    help="port (default 8765; avoids llama 8152-8160 and ComfyUI 8188)")
+    sv.add_argument("--verbose", action="store_true", help="log every HTTP request")
+    sv.set_defaults(func=cmd_serve)
 
     args = p.parse_args()
     args.func(args)
