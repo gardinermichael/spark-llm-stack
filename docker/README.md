@@ -10,9 +10,12 @@ For the autoresearch launcher see [`autoresearch/README.md`](autoresearch/README
 
 ## Before you begin (read — it prevents a brick)
 
-- **Single-slot rule**: running more than one heavyweight slot exhausts the
-  128 GB unified memory pool and triggers an OOM respawn brick loop. Always
-  use `docker-llm-switch` or `./run.sh` — never raw `docker run`. See
+- **No-two-heavyweights rule**: running more than one heavyweight slot
+  (coder / architect / gemma / gptoss) exhausts the 128 GB unified memory
+  pool and triggers an OOM respawn brick loop. Lightweights (vision /
+  imagine / comfyui) can coexist with each other and with one heavyweight
+  — `docker-llm-switch` enforces this automatically. Always go through it
+  or `./run.sh` — never raw `docker run`. See
   [gremlins/00_POSTMORTEM.md](../gremlins/00_POSTMORTEM.md).
 - **Requirements**: NVIDIA driver 580+, CUDA 13.0+, NVIDIA Container Toolkit,
   Docker with `--gpus=all` working (`docker run --rm --gpus=all nvidia/cuda:13.2.0-base-ubuntu24.04 nvidia-smi`).
@@ -475,7 +478,7 @@ tailscale ssh m@100.64.12.5      # raw tailnet IP also works
 ```bash
 docker-llm-switch status                    # slot table: port, memory bar, color-coded fit
 docker-llm-switch memory                    # live memory monitor (Ctrl+C to exit)
-docker-llm-switch <slot>                    # switch to <slot> (stops others first)
+docker-llm-switch <slot>                    # start <slot> (stops conflicting heavyweights only — see Coexistence policy below)
 docker-llm-switch off                       # stop everything
 docker-llm-switch panic                     # emergency: stop everything + drop caches
 
@@ -484,6 +487,28 @@ docker-llm-switch boot-default architect    # only one slot ever has a restart p
 docker-llm-switch boot-status               # show what starts at daemon boot
 docker-llm-switch boot-safe                 # clear all restart policies
 ```
+
+### Coexistence policy
+
+Slots are split into two weight classes (mirrors the systemd `Conflicts=`
+pool in `harden-llm-stack.sh`):
+
+| Class | Slots | Memory cap |
+|-------|-------|------------|
+| Heavyweight | `coder`, `architect`, `gemma`, `gptoss` | 40 – 80 G |
+| Lightweight | `vision`, `imagine`, `comfyui` | 16 – 40 G |
+
+Starting a slot stops only the running slots that **conflict** with it:
+
+- **Heavyweight ↔ heavyweight**: always exclusive (POSTMORTEM — two
+  together can exhaust the 121 GiB pool and brick the box).
+- **Lightweight ↔ anything**: coexist, subject to the admission gate
+  (`MemAvailable − 8 GiB headroom ≥ projected cap`). The gate logs
+  "admission ok: …GiB fits" when the new slot is allowed alongside
+  whatever is already running.
+
+This means `docker-llm-switch imagine` while `comfyui` is running keeps
+`comfyui` up; switching from `coder` to `architect` stops `coder` first.
 
 ### Status color coding
 
