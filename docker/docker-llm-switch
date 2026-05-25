@@ -35,6 +35,19 @@ WAIT_TIMEOUT=300
 
 SLOTS=(coder architect gemma vision gptoss imagine comfyui)
 
+# Single source of truth for the user-shell CLI tools this script knows
+# about. Format: "name:relpath-from-repo-root". Consumed by the health
+# section (presence + drift + remediation). The repo-side installer
+# (`tools/install-user-cli.sh`) keeps its own copy; mismatches there will
+# show up as drift/missing rows in `health` output rather than silently
+# diverge.
+USER_CLI_TOOLS=(
+  "docker-llm-switch:docker/docker-llm-switch"
+  "llm-switch:systemd/llm-switch"
+  "flux-gen:tools/flux-gen"
+  "tok-log:tools/tok-log"
+)
+
 # ── config override storage ───────────────────────────────────────────────────
 # Per-slot overrides live in CONF_DIR/overrides/<slot>, one "flag=value" per line.
 # docker_run_slot applies these on top of the built-in CMD_<slot> arrays.
@@ -791,8 +804,9 @@ show_health() {
   printf "  %bCLI tools%b\n" "$BLD" "$NC"
   printf "  %s\n" "──────────────────────────────────────────────────────────"
 
-  local tool path
-  for tool in docker-llm-switch llm-switch flux-gen tok-log; do
+  local tool path entry
+  for entry in "${USER_CLI_TOOLS[@]}"; do
+    tool="${entry%%:*}"
     path=$(command -v "$tool" 2>/dev/null || true)
     if [ -n "$path" ]; then
       _row "$tool" 1 "$path"
@@ -823,11 +837,7 @@ show_health() {
     printf "  %b(repo: %s)%b\n" "$DIM" "$repo" "$NC"
 
     local entry name rel dst src target
-    for entry in \
-        "docker-llm-switch:docker/docker-llm-switch" \
-        "llm-switch:systemd/llm-switch" \
-        "flux-gen:tools/flux-gen" \
-        "tok-log:tools/tok-log"; do
+    for entry in "${USER_CLI_TOOLS[@]}"; do
       name="${entry%%:*}"
       rel="${entry#*:}"
       dst="$HOME/.local/bin/$name"
@@ -887,7 +897,14 @@ show_health() {
   printf "  %bToken-speed logging%b\n" "$BLD" "$NC"
   printf "  %s\n" "──────────────────────────────────────────────────────────"
 
-  local db_path="${TOK_LOG_DB:-${XDG_DATA_HOME:-$HOME/.local/share}/spark-llm-stack/token-speed.db}"
+  # Prefer the canonical path tok-log itself reports, so renames/defaults
+  # there don't silently drift this check. Fall back to the same env-var
+  # resolution tok-log uses if the binary isn't on PATH.
+  local db_path tok_log
+  if tok_log=$(_find_tok_log); then
+    db_path=$("$tok_log" db-path 2>/dev/null || true)
+  fi
+  : "${db_path:=${TOK_LOG_DB:-${XDG_DATA_HOME:-$HOME/.local/share}/spark-llm-stack/token-speed.db}}"
   local db_dir; db_dir=$(dirname "$db_path")
   if mkdir -p "$db_dir" 2>/dev/null && [ -w "$db_dir" ]; then
     if [ -e "$db_path" ]; then
@@ -907,12 +924,12 @@ show_health() {
   if [ "${DOCKER_LLM_SWITCH_NO_WATCH:-0}" = "1" ]; then
     _row "auto-watcher" 1 "disabled (DOCKER_LLM_SWITCH_NO_WATCH=1)"
   else
-    local wdir="${XDG_RUNTIME_DIR:-/tmp}/docker-llm-switch"
-    local llama_slot ctr_state_v wpid
-    for llama_slot in coder architect gemma vision gptoss; do
+    local llama_slot ctr_state_v wpid pf
+    for llama_slot in "${SLOTS[@]}"; do
+      _is_watchable_slot "$llama_slot" || continue
       ctr_state_v=$(ctr_state "$(ctr_name "$llama_slot")")
       [ "$ctr_state_v" != "running" ] && continue
-      local pf="$wdir/watcher-$llama_slot.pid"
+      pf=$(_watcher_pid_file "$llama_slot")
       if [ -f "$pf" ]; then
         wpid=$(cat "$pf" 2>/dev/null)
         if [ -n "$wpid" ] && kill -0 "$wpid" 2>/dev/null; then
@@ -988,7 +1005,14 @@ _offer_remediation() {
         # drifted, so we clear them first and let the installer recreate
         # them as symlinks. `rm -f` is harmless on missing files and on
         # the symlinks the installer itself owns.
-        cmds+=("rm -f \"\$HOME/.local/bin/docker-llm-switch\" \"\$HOME/.local/bin/llm-switch\" \"\$HOME/.local/bin/flux-gen\" \"\$HOME/.local/bin/tok-log\" && \"$repo/tools/install-user-cli.sh\"")
+        # Build the rm -f list from USER_CLI_TOOLS so adding a new tool
+        # only requires editing the array at the top of this script.
+        local rm_paths="" tool_entry tool_name
+        for tool_entry in "${USER_CLI_TOOLS[@]}"; do
+          tool_name="${tool_entry%%:*}"
+          rm_paths+=" \"\$HOME/.local/bin/$tool_name\""
+        done
+        cmds+=("rm -f${rm_paths} && \"$repo/tools/install-user-cli.sh\"")
         ;;
     esac
   done
