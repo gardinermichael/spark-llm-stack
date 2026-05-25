@@ -513,6 +513,8 @@ disturbing anything else that's running:
   `restart`, so a boot-default slot stays a boot-default slot.
 - Both skip the conflict / admission / cross-stack checks — they apply
   only when a *new* slot enters the memory budget.
+- `<slot> bench` and `<slot> watch` are also per-slot subcommands — see
+  [Token-speed logging](#token-speed-logging) below.
 
 Typical sequence for applying a runtime config change:
 
@@ -600,6 +602,78 @@ docker-llm-switch coder config --reset -c   # clear just the -c override
 
 Overrides are stored in `~/.config/docker-llm-switch/overrides/<slot>` as `flag=value` lines.
 Any flag in the slot's built-in command can be overridden; unknown flags are appended with a warning.
+
+### Token-speed logging
+
+Every llama-slot start (coder/architect/gemma/vision/gptoss) automatically spawns a background
+watcher that polls the slot's `/metrics` endpoint and appends samples to SQLite at
+`~/.local/share/spark-llm-stack/token-speed.db`. You don't have to do anything — just use
+`docker-llm-switch <slot>` as normal. The watcher is killed on `stop` / `restart` / `off` /
+`panic`, and self-terminates after ~2 min of consecutive fetch failures so a container
+removed outside this CLI doesn't leave a stranded process.
+
+PID + log files live under `${XDG_RUNTIME_DIR:-/tmp}/docker-llm-switch/watcher-<slot>.{pid,log}`.
+
+**Two capture modes**, sharing one DB:
+
+| Mode | Trigger | Table | Granularity |
+|---|---|---|---|
+| Passive watcher (auto) | every llama-slot start | `metrics_samples` | time-series counters / gauges |
+| Active benchmark | explicit `<slot> bench` | `runs` | per-request, full effective argv |
+
+Both record `session_id` (container instance id), so you can join them within one warm container.
+
+**Inspect the log:**
+
+```bash
+docker-llm-switch log                              # recent bench runs (default: list)
+docker-llm-switch log samples --slot coder         # recent /metrics samples
+docker-llm-switch log show 42                      # full config + JSON blobs for one bench
+docker-llm-switch log db-path                      # path to the SQLite file
+```
+
+**Run a controlled benchmark** (captures the full effective argv — including
+`--cache-type-k`, `--spec-draft-n-max`, `--kv-unified`, etc. — from `docker inspect`):
+
+```bash
+docker-llm-switch coder bench                                    # default prompt, 256 tokens
+docker-llm-switch coder bench --tag mtp-n3 --n-predict 512
+docker-llm-switch coder bench --prompt "$(cat my-prompt.txt)"
+```
+
+**Env knobs:**
+
+| Variable | Effect |
+|---|---|
+| `DOCKER_LLM_SWITCH_NO_WATCH=1` | disable the auto-watcher for this invocation |
+| `TOK_LOG_INTERVAL=<seconds>` | poll interval (default 10) |
+| `TOK_LOG_DB=<path>` | override the SQLite path |
+
+**Sample analysis queries.** Real throughput per container session, derived from the
+monotonic counters:
+
+```sql
+SELECT session_id, model_name,
+       MAX(predicted_tokens_total) - MIN(predicted_tokens_total) AS tokens,
+       MAX(predicted_seconds_total) - MIN(predicted_seconds_total) AS secs,
+       CAST(MAX(predicted_tokens_total) - MIN(predicted_tokens_total) AS REAL) /
+         NULLIF(MAX(predicted_seconds_total) - MIN(predicted_seconds_total), 0) AS tok_per_sec
+FROM metrics_samples WHERE error IS NULL GROUP BY session_id;
+```
+
+Compare bench results across MTP `--spec-draft-n-max` settings (e.g. for the
+`gremlins/02_QWEN36-27B-MTP-CUDA-CRASH.md` mitigation ladder):
+
+```sql
+SELECT spec_draft_n_max, cache_type_k, cache_type_v,
+       COUNT(*) AS runs, AVG(predicted_per_second) AS avg_tps
+FROM runs WHERE model_name LIKE 'Qwen3.6-27B%' AND error IS NULL
+GROUP BY 1,2,3 ORDER BY avg_tps DESC;
+```
+
+`imagine` and `comfyui` are skipped (their APIs don't expose llamacpp-shape metrics or
+`/completion`). Requires `tok-log` to be installed — `tools/install-user-cli.sh` symlinks
+it alongside `docker-llm-switch`.
 
 ---
 
