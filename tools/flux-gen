@@ -25,10 +25,11 @@ curl -sf "$BASE/v1/models" > /dev/null 2>&1 || {
 }
 
 echo "Generating: $PROMPT"
-echo "Size: ${WIDTH}x${HEIGHT}  Seed: $SEED"
+echo "Size:  ${WIDTH}x${HEIGHT}"
+[ "$SEED" != "-1" ] && echo "Seed:  $SEED"
 
 python3 - "$BASE" "$PROMPT" "$WIDTH" "$HEIGHT" "$SEED" "$OUTDIR" <<'PYEOF'
-import sys, time, json, base64
+import sys, time, json, base64, secrets
 from urllib import request, error
 
 base, prompt, width_s, height_s, seed_s, outdir = sys.argv[1:7]
@@ -45,6 +46,15 @@ def parse_int(name, value, lo, hi):
 width  = parse_int("width",  width_s,  64, 4096)
 height = parse_int("height", height_s, 64, 4096)
 seed   = parse_int("seed",   seed_s,   -1, 2**31 - 1)
+
+# sd-server's OpenAI endpoint treats seed=-1 (and any missing seed) as
+# "use the server's --seed default", which is 42 — so every default
+# invocation would produce the same image. Synthesize one client-side
+# instead. The PNG metadata still records the seed we sent, so it stays
+# reproducible.
+if seed == -1:
+    seed = secrets.randbelow(2**31 - 1)
+    print(f"Seed:  {seed}  (random)")
 
 payload = json.dumps({
     "prompt": prompt,
