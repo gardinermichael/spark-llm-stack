@@ -28,8 +28,8 @@ echo "Generating: $PROMPT"
 echo "Size: ${WIDTH}x${HEIGHT}  Seed: $SEED"
 
 python3 - "$BASE" "$PROMPT" "$WIDTH" "$HEIGHT" "$SEED" "$OUTDIR" <<'PYEOF'
-import sys, time, base64
-import requests
+import sys, time, json, base64
+from urllib import request, error
 
 base, prompt, width_s, height_s, seed_s, outdir = sys.argv[1:7]
 
@@ -46,21 +46,31 @@ width  = parse_int("width",  width_s,  64, 4096)
 height = parse_int("height", height_s, 64, 4096)
 seed   = parse_int("seed",   seed_s,   -1, 2**31 - 1)
 
-payload = {
+payload = json.dumps({
     "prompt": prompt,
     "size": f"{width}x{height}",
     "n": 1,
     "seed": seed,
-}
+}).encode()
+
+req = request.Request(
+    f"{base}/v1/images/generations",
+    data=payload,
+    headers={"content-type": "application/json"},
+    method="POST",
+)
 
 start = time.time()
-r = requests.post(f"{base}/v1/images/generations", json=payload, timeout=600)
-r.raise_for_status()
-data = r.json().get("data", [])
+try:
+    with request.urlopen(req, timeout=600) as resp:
+        body = json.loads(resp.read())
+except error.HTTPError as e:
+    sys.exit(f"flux-gen: HTTP {e.code}: {e.read()[:300].decode(errors='replace')}")
 elapsed = time.time() - start
 
+data = body.get("data", [])
 if not data or "b64_json" not in data[0]:
-    sys.exit(f"flux-gen: unexpected response: {r.text[:300]}")
+    sys.exit(f"flux-gen: unexpected response: {json.dumps(body)[:300]}")
 
 img = base64.b64decode(data[0]["b64_json"])
 fname = f"{outdir}/flux-{int(time.time())}.png"
