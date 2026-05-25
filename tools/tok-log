@@ -1145,7 +1145,7 @@ async function loadTimeline() {
     const short = (sess.split(':')[1] || sess.slice(0,12));
     datasets.push({
       label: `${rows[0].slot}: ${short}`,
-      data: rows.map(r => ({x: r.ts, y: r.predicted_tokens_per_second})),
+      data: rows.map(r => ({x: Date.parse(r.ts), y: r.predicted_tokens_per_second})),
       borderColor: palette[i % palette.length],
       backgroundColor: palette[i % palette.length] + '33',
       pointRadius: 1, borderWidth: 1.5, tension: 0.2,
@@ -1169,7 +1169,7 @@ async function loadKV() {
     const short = (sess.split(':')[1] || sess.slice(0,12));
     datasets.push({
       label: `${rows[0].slot}: ${short}`,
-      data: rows.map(r => ({x: r.ts, y: r.kv_cache_usage_ratio * 100})),
+      data: rows.map(r => ({x: Date.parse(r.ts), y: r.kv_cache_usage_ratio * 100})),
       borderColor: palette[i % palette.length],
       backgroundColor: palette[i % palette.length] + '33',
       pointRadius: 1, borderWidth: 1.5, tension: 0.2, fill: false,
