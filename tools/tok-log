@@ -159,6 +159,7 @@ CREATE TABLE IF NOT EXISTS metrics_samples (
     requests_processing         INTEGER,
     requests_deferred           INTEGER,
     n_busy_slots_per_decode     REAL,
+    n_tokens_max                INTEGER,
 
     metrics_raw                 TEXT,   -- json map of every metric we saw
     error                       TEXT
@@ -201,6 +202,11 @@ def db_connect():
     for col, typ in wanted.items():
         if col not in existing:
             conn.execute(f"ALTER TABLE runs ADD COLUMN {col} {typ}")
+    # Forward-compat for metrics_samples too.
+    existing_s = {r[1] for r in conn.execute("PRAGMA table_info(metrics_samples)").fetchall()}
+    for col, typ in {"n_tokens_max": "INTEGER"}.items():
+        if col not in existing_s:
+            conn.execute(f"ALTER TABLE metrics_samples ADD COLUMN {col} {typ}")
     conn.executescript(INDEXES)
     return conn
 
@@ -632,6 +638,7 @@ METRIC_COLUMNS = {
     "llamacpp:requests_processing":         ("requests_processing", int),
     "llamacpp:requests_deferred":           ("requests_deferred", int),
     "llamacpp:n_busy_slots_per_decode":     ("n_busy_slots_per_decode", float),
+    "llamacpp:n_tokens_max":                ("n_tokens_max", int),
 }
 
 
@@ -914,10 +921,11 @@ def _api_samples(conn, qs):
     where, params = _filter_where(qs)
     sql = ("SELECT id, ts, slot, session_id, model_name, "
            "prompt_tokens_total, predicted_tokens_total, "
-           "prompt_seconds_total, predicted_seconds_total, "
+           "prompt_seconds_total, predicted_seconds_total, n_decode_total, "
            "prompt_tokens_per_second, predicted_tokens_per_second, "
-           "kv_cache_usage_ratio, kv_cache_tokens, "
-           "requests_processing, requests_deferred, error "
+           "kv_cache_usage_ratio, kv_cache_tokens, n_tokens_max, "
+           "requests_processing, requests_deferred, n_busy_slots_per_decode, "
+           "error "
            "FROM metrics_samples")
     if where:
         sql += " WHERE " + " AND ".join(where)
@@ -999,9 +1007,15 @@ def _build_html():
 
 <div class="tabs">
   <div class="tab active" data-tab="runs">Bench runs</div>
-  <div class="tab" data-tab="timeline">Throughput timeline</div>
+  <div class="tab" data-tab="gen">Gen rate</div>
+  <div class="tab" data-tab="prompt">Prompt rate</div>
+  <div class="tab" data-tab="ctx">Context size</div>
+  <div class="tab" data-tab="mtp">MTP tok/decode</div>
+  <div class="tab" data-tab="conc">Concurrency</div>
+  <div class="tab" data-tab="busy">Busy slots</div>
+  <div class="tab" data-tab="cumtok">Cumulative tokens</div>
+  <div class="tab" data-tab="cumdec">Cumulative decodes</div>
   <div class="tab" data-tab="compare">Bench comparison</div>
-  <div class="tab" data-tab="kv">KV cache usage</div>
 </div>
 
 <div id="panel-runs" class="panel active">
@@ -1019,9 +1033,52 @@ def _build_html():
   </div>
 </div>
 
-<div id="panel-timeline" class="panel">
+<div id="panel-gen" class="panel">
   <h2>predicted_tokens_per_second over time (per session)</h2>
-  <div class="chart-wrap"><canvas id="chart-timeline"></canvas></div>
+  <div class="muted small">Average generation rate since process start, per /metrics scrape.</div>
+  <div class="chart-wrap"><canvas id="chart-gen"></canvas></div>
+</div>
+
+<div id="panel-prompt" class="panel">
+  <h2>prompt_tokens_per_second over time (per session)</h2>
+  <div class="muted small">Average prompt-processing rate since process start.</div>
+  <div class="chart-wrap"><canvas id="chart-prompt"></canvas></div>
+</div>
+
+<div id="panel-ctx" class="panel">
+  <h2>n_tokens_max over time (per session)</h2>
+  <div class="muted small">Max tokens loaded across active slots. Stand-in for KV pressure when kv_cache_usage_ratio isn't emitted.</div>
+  <div class="chart-wrap"><canvas id="chart-ctx"></canvas></div>
+</div>
+
+<div id="panel-mtp" class="panel">
+  <h2>tokens accepted per decode (predicted_total / n_decode_total)</h2>
+  <div class="muted small">Headline MTP-efficiency metric: &gt; 1.0 means speculative tokens are landing. Cumulative ratio per sample.</div>
+  <div class="chart-wrap"><canvas id="chart-mtp"></canvas></div>
+</div>
+
+<div id="panel-conc" class="panel">
+  <h2>requests_processing &amp; requests_deferred</h2>
+  <div class="muted small">In-flight vs queued requests. Deferred &gt; 0 means the server is saturating.</div>
+  <div class="chart-wrap"><canvas id="chart-conc"></canvas></div>
+</div>
+
+<div id="panel-busy" class="panel">
+  <h2>n_busy_slots_per_decode over time (per session)</h2>
+  <div class="muted small">Average busy slots observed each decode step.</div>
+  <div class="chart-wrap"><canvas id="chart-busy"></canvas></div>
+</div>
+
+<div id="panel-cumtok" class="panel">
+  <h2>Cumulative tokens (prompt &amp; predicted)</h2>
+  <div class="muted small">Running totals since process start. Slope = throughput.</div>
+  <div class="chart-wrap"><canvas id="chart-cumtok"></canvas></div>
+</div>
+
+<div id="panel-cumdec" class="panel">
+  <h2>Cumulative decode steps (n_decode_total)</h2>
+  <div class="muted small">Number of decode iterations. With MTP, tokens grow faster than decodes.</div>
+  <div class="chart-wrap"><canvas id="chart-cumdec"></canvas></div>
 </div>
 
 <div id="panel-compare" class="panel">
@@ -1033,11 +1090,6 @@ def _build_html():
     <option value="config">model + n_max + kv types</option>
   </select></label>
   <div class="chart-wrap" style="margin-top:10px"><canvas id="chart-compare"></canvas></div>
-</div>
-
-<div id="panel-kv" class="panel">
-  <h2>kv_cache_usage_ratio over time (per session)</h2>
-  <div class="chart-wrap"><canvas id="chart-kv"></canvas></div>
 </div>
 
 <div id="modal" onclick="if(event.target.id==='modal') this.classList.remove('show')">
@@ -1135,52 +1187,85 @@ function groupBy(arr, keyFn) {
   return m;
 }
 
-async function loadTimeline() {
-  const samples = await api('/api/samples', {limit: 20000});
-  const valid = samples.filter(s => s.error==null && s.predicted_tokens_per_second != null);
-  const bySession = groupBy(valid, s => s.session_id || 'unknown');
-  const datasets = [];
-  let i = 0;
-  for (const [sess, rows] of bySession) {
-    const short = (sess.split(':')[1] || sess.slice(0,12));
-    datasets.push({
-      label: `${rows[0].slot}: ${short}`,
-      data: rows.map(r => ({x: Date.parse(r.ts), y: r.predicted_tokens_per_second})),
-      borderColor: palette[i % palette.length],
-      backgroundColor: palette[i % palette.length] + '33',
-      pointRadius: 1, borderWidth: 1.5, tension: 0.2,
-    });
-    i++;
-  }
-  renderChart('chart-timeline', 'line', {datasets}, {
-    parsing: false,
-    scales: {x: {type:'time', time:{tooltipFormat:'PP HH:mm:ss'}},
-             y: {title:{display:true,text:'tokens/sec'}, beginAtZero:true}},
-  });
+let _samplesCache = null;
+async function getSamples() {
+  if (_samplesCache) return _samplesCache;
+  _samplesCache = await api('/api/samples', {limit: 20000});
+  return _samplesCache;
 }
 
-async function loadKV() {
-  const samples = await api('/api/samples', {limit: 20000});
-  const valid = samples.filter(s => s.error==null && s.kv_cache_usage_ratio != null);
-  const bySession = groupBy(valid, s => s.session_id || 'unknown');
+function buildSessionSeries(samples, valueFn, labelSuffix='') {
+  const valid = [];
+  for (const s of samples) {
+    if (s.error != null) continue;
+    const y = valueFn(s);
+    if (y == null || Number.isNaN(y)) continue;
+    valid.push({s, y});
+  }
+  const bySession = groupBy(valid, v => v.s.session_id || 'unknown');
   const datasets = [];
   let i = 0;
   for (const [sess, rows] of bySession) {
     const short = (sess.split(':')[1] || sess.slice(0,12));
     datasets.push({
-      label: `${rows[0].slot}: ${short}`,
-      data: rows.map(r => ({x: Date.parse(r.ts), y: r.kv_cache_usage_ratio * 100})),
+      label: `${rows[0].s.slot}: ${short}${labelSuffix}`,
+      data: rows.map(v => ({x: Date.parse(v.s.ts), y: v.y})),
       borderColor: palette[i % palette.length],
       backgroundColor: palette[i % palette.length] + '33',
       pointRadius: 1, borderWidth: 1.5, tension: 0.2, fill: false,
     });
     i++;
   }
-  renderChart('chart-kv', 'line', {datasets}, {
+  return datasets;
+}
+
+async function loadTimeseries(canvasId, valueFn, yLabel, yOpts={}) {
+  const samples = await getSamples();
+  const datasets = buildSessionSeries(samples, valueFn);
+  renderChart(canvasId, 'line', {datasets}, {
     parsing: false,
-    scales: {x: {type:'time'}, y:{min:0,max:100,title:{display:true,text:'KV cache used (%)'}}},
+    scales: {
+      x: {type:'time', time:{tooltipFormat:'PP HH:mm:ss'}},
+      y: {title:{display:true,text:yLabel}, beginAtZero:true, ...yOpts},
+    },
   });
 }
+
+async function loadMultiMetric(canvasId, metrics, yLabel, yOpts={}) {
+  // metrics: [{key, valueFn, color}]
+  const samples = await getSamples();
+  const datasets = [];
+  metrics.forEach((m, mi) => {
+    const sub = buildSessionSeries(samples, m.valueFn, ` · ${m.key}`);
+    sub.forEach((ds, si) => {
+      ds.borderColor = palette[(mi*3 + si) % palette.length];
+      ds.borderDash = mi === 0 ? [] : [4, 3];
+      datasets.push(ds);
+    });
+  });
+  renderChart(canvasId, 'line', {datasets}, {
+    parsing: false,
+    scales: {
+      x: {type:'time', time:{tooltipFormat:'PP HH:mm:ss'}},
+      y: {title:{display:true,text:yLabel}, beginAtZero:true, ...yOpts},
+    },
+  });
+}
+
+const loadGen    = () => loadTimeseries('chart-gen',    r => r.predicted_tokens_per_second, 'predicted tokens/sec');
+const loadPrompt = () => loadTimeseries('chart-prompt', r => r.prompt_tokens_per_second,    'prompt tokens/sec');
+const loadCtx    = () => loadTimeseries('chart-ctx',    r => r.n_tokens_max,                'n_tokens_max');
+const loadMTP    = () => loadTimeseries('chart-mtp',    r => (r.n_decode_total && r.n_decode_total > 0) ? r.predicted_tokens_total / r.n_decode_total : null, 'tokens / decode');
+const loadBusy   = () => loadTimeseries('chart-busy',   r => r.n_busy_slots_per_decode,     'busy slots / decode');
+const loadCumDec = () => loadTimeseries('chart-cumdec', r => r.n_decode_total,              'n_decode_total');
+const loadConc   = () => loadMultiMetric('chart-conc', [
+  {key: 'processing', valueFn: r => r.requests_processing},
+  {key: 'deferred',   valueFn: r => r.requests_deferred},
+], 'requests');
+const loadCumTok = () => loadMultiMetric('chart-cumtok', [
+  {key: 'predicted_total', valueFn: r => r.predicted_tokens_total},
+  {key: 'prompt_total',    valueFn: r => r.prompt_tokens_total},
+], 'tokens (cumulative)');
 
 async function loadCompare() {
   const runs = (await api('/api/runs', {limit: 2000})).filter(r => r.predicted_per_second != null);
@@ -1225,8 +1310,13 @@ const _origLine = Chart.controllers ? null : null;
 
 async function refreshAll() {
   $('status').textContent = 'loading…';
+  _samplesCache = null;
   try {
-    await Promise.all([loadRuns(), loadTimeline(), loadCompare(), loadKV()]);
+    await Promise.all([
+      loadRuns(), loadCompare(),
+      loadGen(), loadPrompt(), loadCtx(), loadMTP(),
+      loadConc(), loadBusy(), loadCumTok(), loadCumDec(),
+    ]);
     $('status').textContent = 'updated ' + new Date().toLocaleTimeString();
   } catch (e) {
     $('status').textContent = 'error: ' + e.message;
