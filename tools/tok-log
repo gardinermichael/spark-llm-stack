@@ -1051,12 +1051,17 @@ const fmtInt = v => v==null ? '—' : v;
 const palette = ['#4493f8','#3fb950','#d29922','#f85149','#a371f7','#db6d28','#39c5cf','#bf3989','#7d8590'];
 let charts = {};
 
+function toDbTs(v) {
+  // datetime-local emits `YYYY-MM-DDTHH:MM`; DB stores ISO text with offset.
+  return `${v}:00+00:00`;
+}
+
 function qs() {
   const p = new URLSearchParams();
   ['slot','model','session'].forEach(k => { const v = $(`f-${k}`).value; if (v) p.set(k, v); });
   const s = $('f-since').value, u = $('f-until').value;
-  if (s) p.set('since', s.replace('T',' ').replace(/$/, ':00Z'));
-  if (u) p.set('until', u.replace('T',' ').replace(/$/, ':00Z'));
+  if (s) p.set('since', toDbTs(s));
+  if (u) p.set('until', toDbTs(u));
   return p;
 }
 async function api(path, extra={}) {
