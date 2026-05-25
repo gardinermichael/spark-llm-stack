@@ -12,10 +12,18 @@ The reasoning, dead-ends, and "do not do this" gotchas in a handoff are
 often more useful than the final fix once you're past the immediate
 incident — keep them.
 
+### Where
+
+All archived handoffs live under [`.archive/handoffs/`](./handoffs/) — the
+top of `.archive/` is reserved for non-handoff retired material (old plans,
+snapshots, deprecated configs). The dedicated subdirectory means
+`ls .archive/handoffs/` is a complete chronological index of every handoff
+this repo has ever produced.
+
 ### Naming
 
 ```
-.archive/NNN_<branch-or-tag>_HANDOFF.md
+.archive/handoffs/NNN_<branch-or-tag>_HANDOFF.md
 ```
 
 - `NNN` — three-digit zero-padded sequence number, ascending. Look at the
@@ -29,10 +37,10 @@ incident — keep them.
 
 ```bash
 # 1. Pick the next number
-ls .archive/*_HANDOFF.md
+ls .archive/handoffs/
 
 # 2. Move + rename in one git step (preserves history)
-git mv HANDOFF.md .archive/NNN_<branch>_HANDOFF.md
+git mv HANDOFF.md .archive/handoffs/NNN_<branch>_HANDOFF.md
 
 # 3. If the handoff referenced future work that's now done, link the
 #    follow-up artifact at the bottom of the archived file -- e.g. the
