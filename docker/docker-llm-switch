@@ -978,11 +978,16 @@ show_usage_watch() {
 usage: docker-llm-switch usage [--interval N] [--slot NAME] [--json]
 
 Streams live token / throughput metrics from each running llama slot's
-/metrics endpoint. Imagine/comfyui slots have no /metrics and are skipped.
+/metrics endpoint, plus any error log lines that appear since the watch
+started. Imagine/comfyui slots have no /metrics and are skipped.
 
   --interval N    refresh every N seconds (default 2)
   --slot NAME     watch only this slot
   --json          one-shot JSON snapshot, no UI (good for piping)
+
+The ERRORS section is hidden when empty. Lines matching this regex
+(case-insensitive) on docker logs count as errors:
+  (error|errno|fatal|panic|segfault|abort|cuda error|out of memory|exception)
 EOF
         return 0 ;;
       *) echo "usage: unknown flag: $1" >&2; return 1 ;;
@@ -1049,6 +1054,18 @@ EOF
   printf '\033[?1049h\033[?25l'
 
   declare -A prev=()
+  # Error log ring buffer (global across slots, most recent first when
+  # rendered). MAX_ERR_LINES caps how many we keep / show; ERR_GREP picks
+  # which log lines count as errors.
+  local -a errors=()
+  local -i MAX_ERR_LINES=12
+  local ERR_GREP='(error|errno|fatal|panic|segfault|abort|cuda error|out of memory|out-of-memory|exception)'
+  # Per-slot "since" timestamp for `docker logs --since` so we don't
+  # re-ingest the same error every frame. Initialise to "now" so old
+  # historical errors don't flood the screen on startup.
+  declare -A errsince=()
+  local watch_start; watch_start=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  for slot in "${active[@]}"; do errsince[$slot]="$watch_start"; done
 
   while true; do
     # Gather one frame's worth of samples first; render second.
@@ -1057,6 +1074,34 @@ EOF
       while IFS='=' read -r k v; do
         cur[${slot}_${k}]="$v"
       done < <(_usage_fetch "$slot")
+    done
+
+    # ── gather new error log lines ────────────────────────────────────────
+    # `docker logs -t --since <rfc3339>` returns only lines newer than the
+    # given timestamp, prefixed with their own RFC3339 timestamp. We
+    # filter by ERR_GREP, reformat the prefix, and append to the ring.
+    local next_since; next_since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    for slot in "${active[@]}"; do
+      local name; name=$(ctr_name "$slot")
+      local since="${errsince[$slot]:-$watch_start}"
+      local raw
+      raw=$(docker logs -t --since "$since" "$name" 2>&1 \
+              | grep -iE "$ERR_GREP" 2>/dev/null || true)
+      if [ -n "$raw" ]; then
+        local line ts hms msg
+        while IFS= read -r line; do
+          # docker -t prefix: "2024-05-25T14:31:02.123456789Z message…"
+          ts=${line%% *}
+          msg=${line#* }
+          hms=${ts#*T}; hms=${hms%%.*}; hms=${hms%Z}
+          errors+=("[$slot $hms] $msg")
+        done <<< "$raw"
+        # Trim to last MAX_ERR_LINES — newest at the tail.
+        if [ "${#errors[@]}" -gt "$MAX_ERR_LINES" ]; then
+          errors=("${errors[@]: -$MAX_ERR_LINES}")
+        fi
+      fi
+      errsince[$slot]="$next_since"
     done
 
     # Render: home cursor, no clear (we erase-below at end to avoid flicker).
@@ -1133,6 +1178,23 @@ EOF
       printf "  %-11s  %14s  %14s   %12s   %12s   %s\n" \
         "$slot" "$p_tok" "$d_tok" "$avg_p" "$avg_d" "$n_dec"
     done
+
+    # ── ERRORS section (only if we have any) ──────────────────────────────
+    if [ "${#errors[@]}" -gt 0 ]; then
+      printf "\n  %bERRORS%b  %b(last %d, since watch start; matched: %s)%b\n" \
+        "$RED" "$NC" "$DIM" "$MAX_ERR_LINES" "$ERR_GREP" "$NC"
+      printf "  %s\n" "──────────────────────────────────────────────────────────────────────────────"
+      local errline
+      for errline in "${errors[@]}"; do
+        # Truncate to terminal width to keep table layout stable.
+        local cols=${COLUMNS:-120}
+        local maxlen=$((cols - 4))
+        if [ "${#errline}" -gt "$maxlen" ]; then
+          errline="${errline:0:$maxlen}…"
+        fi
+        printf "  %b%s%b\n" "$RED" "$errline" "$NC"
+      done
+    fi
 
     # Store this frame as prev for next iteration's deltas.
     local key
