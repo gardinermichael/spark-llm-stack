@@ -22,6 +22,7 @@ TOOLS=(
     "llm-switch:systemd/llm-switch"
     "flux-gen:tools/flux-gen"
     "docker-llm-switch:docker/docker-llm-switch"
+    "tok-log:tools/tok-log"
 )
 
 usage() {

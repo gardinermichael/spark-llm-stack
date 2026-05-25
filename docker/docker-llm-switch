@@ -1618,6 +1618,107 @@ is_slot() {
   return 1
 }
 
+# Locate the tok-log script. Prefers the installed symlink at
+# ~/.local/bin/tok-log, falls back to the repo copy alongside this script,
+# then to $PATH. Echoes the path on success; returns 1 if none found.
+_find_tok_log() {
+  local candidates=(
+    "$HOME/.local/bin/tok-log"
+    "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)/tools/tok-log"
+  )
+  local c
+  for c in "${candidates[@]}"; do
+    [ -n "$c" ] && [ -x "$c" ] && { echo "$c"; return 0; }
+  done
+  if command -v tok-log >/dev/null 2>&1; then
+    command -v tok-log
+    return 0
+  fi
+  return 1
+}
+
+# ── auto-watcher lifecycle ────────────────────────────────────────────────────
+#
+# Spawn a background `tok-log watch <slot>` whenever a llama slot starts; kill
+# it on stop/restart/off/panic. Opt-out: set DOCKER_LLM_SWITCH_NO_WATCH=1.
+# PID + log files live under $XDG_RUNTIME_DIR (or /tmp as fallback) so they
+# don't survive a host reboot. Watcher self-terminates after ~2 min of
+# consecutive fetch failures (--max-errors 12) as a safety net for when the
+# container is removed outside the docker-llm-switch lifecycle.
+
+_watcher_dir() {
+  local base="${XDG_RUNTIME_DIR:-/tmp}/docker-llm-switch"
+  mkdir -p "$base"
+  echo "$base"
+}
+_watcher_pid_file() { echo "$(_watcher_dir)/watcher-$1.pid"; }
+_watcher_log_file() { echo "$(_watcher_dir)/watcher-$1.log"; }
+
+# Llama slots only — imagine/comfyui don't expose /metrics in the llamacpp shape.
+_is_watchable_slot() {
+  case "$1" in
+    coder|architect|gemma|vision|gptoss) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+_watcher_running() {
+  local pid_file="$1"
+  [ -f "$pid_file" ] || return 1
+  local pid; pid=$(cat "$pid_file" 2>/dev/null)
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+_spawn_watcher() {
+  local slot="$1"
+  [ "${DOCKER_LLM_SWITCH_NO_WATCH:-0}" = "1" ] && return 0
+  _is_watchable_slot "$slot" || return 0
+
+  local tok_log; tok_log=$(_find_tok_log) || return 0  # silently skip if absent
+  local pid_file; pid_file=$(_watcher_pid_file "$slot")
+  local log_file; log_file=$(_watcher_log_file "$slot")
+
+  if _watcher_running "$pid_file"; then
+    return 0  # already watching this slot
+  fi
+
+  # Fully detach: nohup + setsid (if available) + redirect to log file.
+  # `tok-log watch` already self-terminates after --max-errors fetch failures.
+  if command -v setsid >/dev/null 2>&1; then
+    setsid nohup "$tok_log" watch "$slot" --interval "${TOK_LOG_INTERVAL:-10}" \
+      >>"$log_file" 2>&1 < /dev/null &
+  else
+    nohup "$tok_log" watch "$slot" --interval "${TOK_LOG_INTERVAL:-10}" \
+      >>"$log_file" 2>&1 < /dev/null &
+  fi
+  echo $! > "$pid_file"
+  echo "  watcher: pid $(cat "$pid_file") (log: $log_file)"
+}
+
+_kill_watcher() {
+  local slot="$1"
+  local pid_file; pid_file=$(_watcher_pid_file "$slot")
+  [ -f "$pid_file" ] || return 0
+  local pid; pid=$(cat "$pid_file" 2>/dev/null)
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null || true
+    # Give it a beat to flush its last write.
+    for _ in 1 2 3; do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.1
+    done
+    kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
+    echo "  watcher: stopped (pid $pid)"
+  fi
+  rm -f "$pid_file"
+}
+
+_kill_all_watchers() {
+  for slot in "${SLOTS[@]}"; do
+    _kill_watcher "$slot"
+  done
+}
+
 if is_slot "$CMD"; then
   # Handle per-slot subcommands before any container logic.
   SUBCMD="${2:-}"
@@ -1634,6 +1735,7 @@ if is_slot "$CMD"; then
       else
         echo "$CMD is not running"
       fi
+      _kill_watcher "$CMD"
       exit 0
       ;;
     restart)
@@ -1651,6 +1753,7 @@ if is_slot "$CMD"; then
       fi
       policy=$(ctr_restart_policy "$name")
       echo "→ restarting $CMD"
+      _kill_watcher "$CMD"
       [ "$state" = "running" ] && docker stop "$name" >/dev/null
       ensure_absent "$name" || exit 1
       if [ "$policy" = "unless-stopped" ]; then
@@ -1659,6 +1762,7 @@ if is_slot "$CMD"; then
         docker_run_slot "$CMD" --rm
       fi
       wait_ready "$CMD"
+      _spawn_watcher "$CMD"
       show_status
       exit 0
       ;;
@@ -1672,6 +1776,47 @@ if is_slot "$CMD"; then
         exit 1
       fi
       exec docker logs "${@:3}" "$name"
+      ;;
+    bench)
+      # Run a token-speed benchmark against the slot and record the result
+      # (with full effective argv + model + flags) to SQLite. Llama slots
+      # only — imagine/comfyui don't expose /completion.
+      case "$CMD" in
+        imagine|comfyui)
+          echo "$CMD has no /completion endpoint — bench is for llama slots only." >&2
+          exit 1
+          ;;
+      esac
+      tok_log=$(_find_tok_log) || {
+        echo "tok-log not found. Install with: tools/install-user-cli.sh" >&2
+        exit 1
+      }
+      name=$(ctr_name "$CMD")
+      if [ "$(ctr_state "$name")" != "running" ]; then
+        echo "$CMD is not running — start it first with \`docker-llm-switch $CMD\`." >&2
+        exit 1
+      fi
+      exec "$tok_log" bench "$CMD" "${@:3}"
+      ;;
+    watch)
+      # Passively poll the slot's /metrics endpoint and append samples
+      # to SQLite. Llama slots only.
+      case "$CMD" in
+        imagine|comfyui)
+          echo "$CMD does not expose /metrics in the llamacpp shape — watch is for llama slots only." >&2
+          exit 1
+          ;;
+      esac
+      tok_log=$(_find_tok_log) || {
+        echo "tok-log not found. Install with: tools/install-user-cli.sh" >&2
+        exit 1
+      }
+      name=$(ctr_name "$CMD")
+      if [ "$(ctr_state "$name")" != "running" ]; then
+        echo "$CMD is not running — start it first with \`docker-llm-switch $CMD\`." >&2
+        exit 1
+      fi
+      exec "$tok_log" watch "$CMD" "${@:3}"
       ;;
     debug)
       # Start the slot WITHOUT --rm so the container (and its logs) survive
@@ -1702,6 +1847,7 @@ if is_slot "$CMD"; then
       # Note the missing --rm.
       docker_run_slot "$CMD"
       wait_ready "$CMD"
+      _spawn_watcher "$CMD"
       echo ""
       echo "→ following logs. Ctrl+C detaches; the container keeps running"
       echo "  until it dies or you run \`docker-llm-switch $CMD stop\`."
@@ -1715,7 +1861,7 @@ if is_slot "$CMD"; then
       ;;
     *)
       echo "unknown subcommand for slot '$CMD': $SUBCMD" >&2
-      echo "valid subcommands: config | stop | restart | debug | logs" >&2
+      echo "valid subcommands: config | stop | restart | debug | logs | bench | watch" >&2
       exit 1
       ;;
   esac
@@ -1729,6 +1875,7 @@ if is_slot "$CMD"; then
   # cross-stack workloads despite no new container being started.
   if [ "$(ctr_state "$target")" = "running" ]; then
     echo "  already running"
+    _spawn_watcher "$CMD"  # idempotent — no-op if watcher already running
     show_status
     exit 0
   fi
@@ -1763,6 +1910,7 @@ if is_slot "$CMD"; then
     run_slot "$CMD"
     wait_ready "$CMD"
   fi
+  _spawn_watcher "$CMD"
   show_status
   exit 0
 fi
@@ -1774,6 +1922,7 @@ case "$CMD" in
       name=$(ctr_name "$slot")
       [ "$(ctr_state "$name")" = "running" ] && docker stop "$name" >/dev/null && echo "  stopped $slot"
     done
+    _kill_all_watchers
     show_status
     ;;
   status)
@@ -1804,7 +1953,24 @@ case "$CMD" in
     boot_status
     ;;
   panic)
+    _kill_all_watchers
     spark_panic_stop_all
+    ;;
+  log|bench-log)
+    # Forward to tok-log. `docker-llm-switch log` with no sub = list.
+    # Examples:
+    #   docker-llm-switch log                       (recent runs)
+    #   docker-llm-switch log list --slot coder
+    #   docker-llm-switch log show 42
+    #   docker-llm-switch log db-path
+    tok_log=$(_find_tok_log) || {
+      echo "tok-log not found. Install with: tools/install-user-cli.sh" >&2
+      exit 1
+    }
+    if [ $# -lt 2 ]; then
+      exec "$tok_log" list
+    fi
+    exec "$tok_log" "${@:2}"
     ;;
   -h|--help|help)
     cat <<EOF
@@ -1818,6 +1984,18 @@ Runtime:
                                     follows logs live (Ctrl+C detaches, container keeps running)
   docker-llm-switch <slot> logs …   shortcut for \`docker logs spark-llm-<slot>\`
                                     (e.g. logs -f, logs --tail 200, logs --since 5m)
+  docker-llm-switch <slot> bench [--prompt … --n-predict N --tag X]
+                                    benchmark the slot with a controlled prompt and
+                                    log timings + effective argv + model to SQLite.
+                                    Llama slots only (not imagine/comfyui).
+  docker-llm-switch <slot> watch [--interval 10 --samples N --verbose]
+                                    passively poll the slot's /metrics endpoint
+                                    and append samples to SQLite. Runs until
+                                    Ctrl+C (or --samples N).
+  docker-llm-switch log [list|samples|show|metrics|db-path …]
+                                    inspect the token-speed log (default: \`list\`).
+                                    e.g. \`log list --slot coder\`, \`log show 42\`,
+                                    \`log samples --slot coder --limit 50\`.
   docker-llm-switch off             stop everything
   docker-llm-switch status          color-coded slot table with port + memory bars
   docker-llm-switch health          verify OOM failsafe, CLI tools, and installed-file drift
@@ -1863,6 +2041,17 @@ Memory monitor sections:
   HOST PROCESSES   top-10 host processes by RSS (Docker shims excluded)
   SYSTEM           free -h summary, swap if present
 
+Auto token-speed watcher:
+  Every llama-slot start (coder/architect/gemma/vision/gptoss) spawns a
+  background \`tok-log watch <slot>\` that polls /metrics into SQLite. The
+  watcher is killed on stop/restart/off/panic, and self-terminates after
+  ~2 min of fetch failures (so a container removed outside this CLI
+  doesn't leave a stranded watcher). PID + log under
+  \${XDG_RUNTIME_DIR:-/tmp}/docker-llm-switch/watcher-<slot>.{pid,log}.
+
+  Opt-out:  DOCKER_LLM_SWITCH_NO_WATCH=1
+  Interval: TOK_LOG_INTERVAL=<seconds>  (default 10)
+
 Env overrides:
   SPARK_IMAGE          llama slots image (default: spark-llm-stack)
   SPARK_IMAGE_IMAGINE  sd-server image    (default: spark-llm-imagine)
@@ -1870,6 +2059,8 @@ Env overrides:
   MODELS_DIR           host model dir     (default: \$HOME/models)
   COMFY_DIR            host comfyui dir   (default: \$HOME/comfyui)
   WATCH_INTERVAL       memory refresh seconds (default: 35)
+  DOCKER_LLM_SWITCH_NO_WATCH  disable auto token-speed watcher (default: 0)
+  TOK_LOG_INTERVAL     watcher poll interval in seconds   (default: 10)
 EOF
     ;;
   *)

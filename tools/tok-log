@@ -1,0 +1,892 @@
+#!/usr/bin/env python3
+# tok-log — record llama-server token-speed benchmarks into SQLite.
+#
+# Usage:
+#   tok-log bench <slot> [--prompt "..."] [--n-predict 256] [--tag note]
+#   tok-log list  [--slot X] [--limit 20]
+#   tok-log show  <id>
+#   tok-log db-path
+#
+# What it records:
+#   - Timings from POST /completion (prompt + predicted tokens/sec).
+#   - Full effective argv of the running server, captured from:
+#       1. `docker inspect spark-llm-<slot>` (docker path), or
+#       2. `systemctl --user show <unit> -p ExecStart` (systemd path),
+#       3. /props as a last-resort fallback.
+#     The argv is parsed into a flag→value JSON map so any flag from
+#     `docker-llm-switch <slot> config` (and beyond — --cache-type-k,
+#     --kv-unified, --cache-reuse, --spec-draft-n-max, …) is queryable
+#     via json_extract.
+#   - Model name (basename of `-m` or value of `-hf`) as its own column.
+#   - Active override file from
+#     ${XDG_CONFIG_HOME:-~/.config}/docker-llm-switch/overrides/<slot>.
+#
+# Slots and ports mirror systemd/llm-switch :: PORTS. Keep in sync when
+# adding a slot (see CLAUDE.md "How slots are defined"). Llama slots only.
+
+import argparse
+import json
+import os
+import shutil
+import sqlite3
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+PORTS = {
+    "coder":     8152,
+    "architect": 8154,
+    "gemma":     8156,
+    "vision":    8155,
+    "gptoss":    8157,
+}
+
+UNITS = {
+    "coder":     "qwen27-mtp.service",
+    "architect": "qwen35-mtp.service",
+    "gemma":     "gemma-31b.service",
+    "vision":    "gemma-vision.service",
+    "gptoss":    "gptoss-20b.service",
+}
+
+CONTAINER_PREFIX = "spark-llm-"
+
+DEFAULT_PROMPT = (
+    "Write a short technical explanation of how speculative decoding "
+    "improves throughput in transformer inference. Be concrete."
+)
+
+DB_PATH = Path(
+    os.environ.get("TOK_LOG_DB")
+    or (Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share"))
+        / "spark-llm-stack" / "token-speed.db")
+)
+
+# Promoted scalar columns for cheap filtering. Everything else lives in
+# the flags JSON blob.
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS runs (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts                  TEXT    NOT NULL,
+    slot                TEXT    NOT NULL,
+    port                INTEGER NOT NULL,
+    host                TEXT    NOT NULL,
+    tag                 TEXT,
+    session_id          TEXT,        -- container instance id (slot:cid:startedAt)
+
+    -- model identity
+    model_name          TEXT,        -- basename of -m, or value of -hf
+    model_alias         TEXT,
+    model_path          TEXT,
+    model_hf            TEXT,        -- -hf repo:quant if used
+
+    -- promoted flags (frequently filtered on)
+    n_ctx               INTEGER,
+    n_batch             INTEGER,
+    n_ubatch            INTEGER,
+    n_parallel          INTEGER,
+    n_gpu_layers        INTEGER,
+    flash_attn          TEXT,
+    cache_type_k        TEXT,
+    cache_type_v        TEXT,
+    cache_ram           INTEGER,
+    cache_reuse         INTEGER,
+    ctx_checkpoints     INTEGER,
+    kv_unified          INTEGER,     -- 1/0
+    spec_type           TEXT,
+    spec_draft_n_max    INTEGER,
+    spec_draft_n_min    INTEGER,
+    spec_draft_p_min    REAL,
+    threads             INTEGER,
+    threads_batch       INTEGER,
+    temp                REAL,
+    top_k               INTEGER,
+    top_p               REAL,
+    min_p               REAL,
+    reasoning           TEXT,
+    reasoning_budget    INTEGER,
+    reasoning_format    TEXT,
+
+    -- timings
+    n_predict_req       INTEGER,
+    prompt_tokens       INTEGER,
+    predicted_tokens    INTEGER,
+    prompt_ms           REAL,
+    predicted_ms        REAL,
+    prompt_per_second   REAL,
+    predicted_per_second REAL,
+    wall_ms             REAL,
+
+    -- raw blobs
+    prompt              TEXT,
+    cmd_source          TEXT,        -- 'docker' | 'systemd' | 'props' | 'none'
+    cmd_argv            TEXT,        -- json array, full effective argv
+    flags               TEXT,        -- json object, flag → value map
+    overrides           TEXT,        -- json object from override file
+    generation_settings TEXT,        -- json from /props
+    props               TEXT,        -- json from /props
+    timings             TEXT,        -- json (raw)
+    error               TEXT
+);
+"""
+
+SAMPLES_SCHEMA = """
+CREATE TABLE IF NOT EXISTS metrics_samples (
+    id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts                          TEXT    NOT NULL,
+    slot                        TEXT    NOT NULL,
+    port                        INTEGER NOT NULL,
+    host                        TEXT    NOT NULL,
+    session_id                  TEXT,
+    model_name                  TEXT,
+
+    -- llamacpp counters (cumulative since process start)
+    prompt_tokens_total         INTEGER,
+    predicted_tokens_total      INTEGER,
+    prompt_seconds_total        REAL,
+    predicted_seconds_total     REAL,
+    n_decode_total              INTEGER,
+
+    -- llamacpp gauges
+    prompt_tokens_per_second    REAL,
+    predicted_tokens_per_second REAL,
+    kv_cache_usage_ratio        REAL,
+    kv_cache_tokens             INTEGER,
+    requests_processing         INTEGER,
+    requests_deferred           INTEGER,
+    n_busy_slots_per_decode     REAL,
+
+    metrics_raw                 TEXT,   -- json map of every metric we saw
+    error                       TEXT
+);
+"""
+
+INDEXES = """
+CREATE INDEX IF NOT EXISTS runs_slot_ts        ON runs (slot, ts DESC);
+CREATE INDEX IF NOT EXISTS runs_model_name_ts  ON runs (model_name, ts DESC);
+CREATE INDEX IF NOT EXISTS runs_session        ON runs (session_id);
+CREATE INDEX IF NOT EXISTS samples_slot_ts     ON metrics_samples (slot, ts DESC);
+CREATE INDEX IF NOT EXISTS samples_session_ts  ON metrics_samples (session_id, ts DESC);
+"""
+
+
+def db_connect():
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.executescript(SCHEMA)
+    conn.executescript(SAMPLES_SCHEMA)
+    # Forward-compat: if an older DB existed, add any missing columns.
+    existing = {r[1] for r in conn.execute("PRAGMA table_info(runs)").fetchall()}
+    wanted = {
+        "session_id": "TEXT",
+        "model_name": "TEXT", "model_hf": "TEXT",
+        "n_batch": "INTEGER", "n_ubatch": "INTEGER", "n_parallel": "INTEGER",
+        "n_gpu_layers": "INTEGER", "flash_attn": "TEXT",
+        "cache_type_k": "TEXT", "cache_type_v": "TEXT", "cache_ram": "INTEGER",
+        "cache_reuse": "INTEGER", "ctx_checkpoints": "INTEGER",
+        "kv_unified": "INTEGER", "spec_type": "TEXT",
+        "spec_draft_n_max": "INTEGER", "spec_draft_n_min": "INTEGER",
+        "spec_draft_p_min": "REAL",
+        "threads": "INTEGER", "threads_batch": "INTEGER",
+        "temp": "REAL", "top_k": "INTEGER", "top_p": "REAL", "min_p": "REAL",
+        "reasoning": "TEXT", "reasoning_budget": "INTEGER",
+        "reasoning_format": "TEXT",
+        "cmd_source": "TEXT", "cmd_argv": "TEXT", "flags": "TEXT",
+        "overrides": "TEXT",
+    }
+    for col, typ in wanted.items():
+        if col not in existing:
+            conn.execute(f"ALTER TABLE runs ADD COLUMN {col} {typ}")
+    conn.executescript(INDEXES)
+    return conn
+
+
+# ── HTTP helpers ──────────────────────────────────────────────────────────────
+
+def http_get_json(url, timeout=10):
+    with urllib.request.urlopen(url, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def http_post_json(url, payload, timeout=600):
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data, headers={"Content-Type": "application/json"}
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+# ── effective-argv discovery ──────────────────────────────────────────────────
+
+# Flags that take a value. Anything not in here is treated as a boolean
+# present-flag (stored as True in the flag map).
+VALUE_FLAGS = {
+    "-m", "-hf", "--alias", "--host", "--port", "-c", "-b", "-ub", "-ngl",
+    "--cache-type-k", "--cache-type-v", "--cache-ram", "--cache-reuse",
+    "--ctx-checkpoints", "--parallel", "--threads", "--threads-batch",
+    "--threads-http", "--prio", "--poll", "--spec-type",
+    "--spec-draft-n-max", "--spec-draft-n-min", "--spec-draft-p-min",
+    "--reasoning", "--reasoning-budget", "--reasoning-format",
+    "--temp", "--top-k", "--top-p", "--min-p", "--presence-penalty",
+    "--keep", "-fa",
+}
+
+
+def parse_argv_to_flags(argv):
+    """Return (flag_map, model_name, model_path, model_hf).
+
+    Flags that take a value map to their string value; bare flags map to True.
+    """
+    flags = {}
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if not tok.startswith("-"):
+            i += 1
+            continue
+        if tok in VALUE_FLAGS and i + 1 < len(argv):
+            flags[tok] = argv[i + 1]
+            i += 2
+        else:
+            flags[tok] = True
+            i += 1
+
+    model_path = flags.get("-m") if isinstance(flags.get("-m"), str) else None
+    model_hf = flags.get("-hf") if isinstance(flags.get("-hf"), str) else None
+    if model_path:
+        model_name = os.path.basename(model_path)
+    elif model_hf:
+        model_name = model_hf
+    else:
+        model_name = None
+    return flags, model_name, model_path, model_hf
+
+
+def docker_inspect_cmd(slot):
+    """Return (argv, session_id) for the running container, or (None, None)."""
+    if not shutil.which("docker"):
+        return None, None
+    name = f"{CONTAINER_PREFIX}{slot}"
+    try:
+        out = subprocess.run(
+            ["docker", "inspect", "--format",
+             "{{json .Config.Entrypoint}}|{{json .Config.Cmd}}|"
+             "{{.Id}}|{{.State.StartedAt}}", name],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return None, None
+    if out.returncode != 0:
+        return None, None
+    line = (out.stdout or "").strip()
+    parts = line.split("|", 3)
+    if len(parts) < 4:
+        return None, None
+    ep_raw, cmd_raw, cid, started = parts
+    try:
+        ep = json.loads(ep_raw) or []
+        cm = json.loads(cmd_raw) or []
+    except json.JSONDecodeError:
+        return None, None
+    argv = list(ep) + list(cm)
+    sess = f"{slot}:{cid[:12]}:{started}" if cid and started else None
+    return (argv if argv else None), sess
+
+
+def systemd_show_cmd(slot):
+    """Return (argv, session_id) for the running unit, or (None, None)."""
+    unit = UNITS.get(slot)
+    if not unit or not shutil.which("systemctl"):
+        return None, None
+    try:
+        out = subprocess.run(
+            ["systemctl", "--user", "show", unit,
+             "-p", "ExecStart",
+             "-p", "MainPID",
+             "-p", "ActiveEnterTimestamp"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return None, None
+    if out.returncode != 0:
+        return None, None
+    text = out.stdout or ""
+    # ExecStart=...{ path=<bin> ; argv[]=<bin> <arg1> <arg2> ... ; ...}
+    marker = "argv[]="
+    idx = text.find(marker)
+    argv = None
+    if idx >= 0:
+        tail = text[idx + len(marker):]
+        end = tail.find(" ; ")
+        if end >= 0:
+            tail = tail[:end]
+        argv = tail.strip().split() or None
+
+    pid = ""
+    started = ""
+    for line in text.splitlines():
+        if line.startswith("MainPID="):
+            pid = line.split("=", 1)[1].strip()
+        elif line.startswith("ActiveEnterTimestamp="):
+            started = line.split("=", 1)[1].strip()
+    sess = f"{slot}:pid{pid}:{started}" if pid and pid != "0" else None
+    return argv, sess
+
+
+def load_overrides(slot):
+    base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    conf = base / "docker-llm-switch" / "overrides" / slot
+    if not conf.is_file():
+        return {}
+    out = {}
+    for line in conf.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        out[k.strip()] = v.strip()
+    return out
+
+
+def _f(flags, key, conv, default=None):
+    v = flags.get(key)
+    if v is None or v is True:
+        return default
+    try:
+        return conv(v)
+    except (TypeError, ValueError):
+        return default
+
+
+# ── bench ─────────────────────────────────────────────────────────────────────
+
+def cmd_bench(args):
+    if args.slot not in PORTS:
+        sys.exit(f"unknown slot {args.slot!r}; known: {', '.join(PORTS)}")
+    port = PORTS[args.slot]
+    host = args.host
+    base = f"http://{host}:{port}"
+
+    prompt = args.prompt or DEFAULT_PROMPT
+
+    # /props is best-effort — older builds may not return everything we use.
+    props = {}
+    try:
+        props = http_get_json(f"{base}/props", timeout=5)
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        sys.exit(f"server unreachable at {base}/props: {e}")
+
+    # Discover effective argv + session id.
+    argv = None
+    session_id = None
+    cmd_source = "none"
+    if not args.no_docker:
+        argv, session_id = docker_inspect_cmd(args.slot)
+        if argv:
+            cmd_source = "docker"
+    if argv is None and not args.no_systemd:
+        argv, session_id = systemd_show_cmd(args.slot)
+        if argv:
+            cmd_source = "systemd"
+
+    flags, model_name, model_path_arg, model_hf = ({}, None, None, None)
+    if argv:
+        flags, model_name, model_path_arg, model_hf = parse_argv_to_flags(argv)
+
+    overrides = load_overrides(args.slot)
+
+    # Run the benchmark.
+    payload = {
+        "prompt": prompt,
+        "n_predict": args.n_predict,
+        "cache_prompt": False,
+        "stream": False,
+    }
+    t0 = time.monotonic()
+    err = None
+    resp = {}
+    try:
+        resp = http_post_json(f"{base}/completion", payload, timeout=args.timeout)
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"
+    wall_ms = (time.monotonic() - t0) * 1000.0
+
+    timings = resp.get("timings", {}) if isinstance(resp, dict) else {}
+    gen = resp.get("generation_settings", {}) if isinstance(resp, dict) else {}
+
+    # Fall back to /props for model identity if argv didn't yield it.
+    model_path = model_path_arg or props.get("model_path") or gen.get("model")
+    model_alias = (
+        flags.get("--alias") if isinstance(flags.get("--alias"), str) else None
+        or gen.get("model_alias")
+        or props.get("default_generation_settings", {}).get("model_alias")
+        or props.get("model_alias")
+    )
+    if not model_name and model_path:
+        model_name = os.path.basename(model_path)
+
+    # n_ctx: prefer argv, then /props, then gen settings.
+    n_ctx = _f(flags, "-c", int)
+    if n_ctx is None:
+        n_ctx = (
+            gen.get("n_ctx")
+            or props.get("default_generation_settings", {}).get("n_ctx")
+            or props.get("n_ctx")
+        )
+
+    row = {
+        "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "slot": args.slot, "port": port, "host": host, "tag": args.tag,
+        "session_id": session_id,
+
+        "model_name": model_name,
+        "model_alias": model_alias,
+        "model_path": model_path,
+        "model_hf": model_hf,
+
+        "n_ctx": n_ctx,
+        "n_batch": _f(flags, "-b", int),
+        "n_ubatch": _f(flags, "-ub", int),
+        "n_parallel": _f(flags, "--parallel", int),
+        "n_gpu_layers": _f(flags, "-ngl", int),
+        "flash_attn": (flags.get("-fa") if isinstance(flags.get("-fa"), str)
+                       else ("on" if flags.get("-fa") is True else None)),
+        "cache_type_k": _f(flags, "--cache-type-k", str),
+        "cache_type_v": _f(flags, "--cache-type-v", str),
+        "cache_ram": _f(flags, "--cache-ram", int),
+        "cache_reuse": _f(flags, "--cache-reuse", int),
+        "ctx_checkpoints": _f(flags, "--ctx-checkpoints", int),
+        "kv_unified": 1 if flags.get("--kv-unified") else 0 if flags else None,
+        "spec_type": _f(flags, "--spec-type", str),
+        "spec_draft_n_max": _f(flags, "--spec-draft-n-max", int),
+        "spec_draft_n_min": _f(flags, "--spec-draft-n-min", int),
+        "spec_draft_p_min": _f(flags, "--spec-draft-p-min", float),
+        "threads": _f(flags, "--threads", int),
+        "threads_batch": _f(flags, "--threads-batch", int),
+        "temp": _f(flags, "--temp", float),
+        "top_k": _f(flags, "--top-k", int),
+        "top_p": _f(flags, "--top-p", float),
+        "min_p": _f(flags, "--min-p", float),
+        "reasoning": _f(flags, "--reasoning", str),
+        "reasoning_budget": _f(flags, "--reasoning-budget", int),
+        "reasoning_format": _f(flags, "--reasoning-format", str),
+
+        "n_predict_req": args.n_predict,
+        "prompt_tokens": timings.get("prompt_n"),
+        "predicted_tokens": timings.get("predicted_n"),
+        "prompt_ms": timings.get("prompt_ms"),
+        "predicted_ms": timings.get("predicted_ms"),
+        "prompt_per_second": timings.get("prompt_per_second"),
+        "predicted_per_second": timings.get("predicted_per_second"),
+        "wall_ms": wall_ms,
+
+        "prompt": prompt,
+        "cmd_source": cmd_source,
+        "cmd_argv": json.dumps(argv) if argv else None,
+        "flags": json.dumps(flags, sort_keys=True, default=str) if flags else None,
+        "overrides": json.dumps(overrides, sort_keys=True) if overrides else None,
+        "generation_settings": json.dumps(gen, sort_keys=True) if gen else None,
+        "props": json.dumps(props, sort_keys=True) if props else None,
+        "timings": json.dumps(timings, sort_keys=True) if timings else None,
+        "error": err,
+    }
+
+    cols = ", ".join(row.keys())
+    placeholders = ", ".join(["?"] * len(row))
+    conn = db_connect()
+    with conn:
+        cur = conn.execute(
+            f"INSERT INTO runs ({cols}) VALUES ({placeholders})",
+            list(row.values()),
+        )
+        run_id = cur.lastrowid
+
+    if err:
+        print(f"[#{run_id}] {args.slot} ERROR: {err}")
+        sys.exit(1)
+
+    pps = timings.get("predicted_per_second")
+    pps_s = f"{pps:.2f} tok/s" if isinstance(pps, (int, float)) else "n/a"
+    prs = timings.get("prompt_per_second")
+    prs_s = f"{prs:.2f} tok/s" if isinstance(prs, (int, float)) else "n/a"
+    model_label = model_name or model_alias or "?"
+    extras = []
+    if row["spec_draft_n_max"] is not None:
+        extras.append(f"n_max={row['spec_draft_n_max']}")
+    if row["cache_type_k"] or row["cache_type_v"]:
+        extras.append(f"kv={row['cache_type_k']}/{row['cache_type_v']}")
+    if row["n_ctx"]:
+        extras.append(f"ctx={row['n_ctx']}")
+    extra_s = ("  " + " ".join(extras)) if extras else ""
+    print(f"[#{run_id}] {args.slot}  {model_label}  src={cmd_source}{extra_s}")
+    print(f"         predicted={timings.get('predicted_n')} @ {pps_s}  "
+          f"prompt={timings.get('prompt_n')} @ {prs_s}  wall={wall_ms:.0f}ms")
+
+
+# ── list / show / db-path ─────────────────────────────────────────────────────
+
+def cmd_list(args):
+    conn = db_connect()
+    q = ("SELECT id, ts, slot, model_name, n_ctx, spec_draft_n_max, "
+         "cache_type_k, cache_type_v, "
+         "prompt_tokens, predicted_tokens, "
+         "predicted_per_second, prompt_per_second, tag, session_id, error "
+         "FROM runs")
+    params = []
+    wheres = []
+    if args.slot:
+        wheres.append("slot = ?"); params.append(args.slot)
+    if args.model:
+        wheres.append("model_name LIKE ?"); params.append(f"%{args.model}%")
+    if args.session:
+        wheres.append("session_id = ?"); params.append(args.session)
+    if wheres:
+        q += " WHERE " + " AND ".join(wheres)
+    q += " ORDER BY id DESC LIMIT ?"
+    params.append(args.limit)
+
+    rows = conn.execute(q, params).fetchall()
+    if not rows:
+        print("(no runs)")
+        return
+
+    print(f"  {'id':>4}  {'ts':<20}  {'slot':<10}  {'model':<28}  "
+          f"{'ctx':>6}  {'nmax':>4}  {'kv':<9}  "
+          f"{'pp tok':>7}  {'gen tok':>7}  {'gen t/s':>8}  {'pp t/s':>8}  "
+          f"{'sess':<14}  tag")
+    for r in rows:
+        (rid, ts, slot, model, ctx, nmax, ck, cv,
+         pt, gt, pps, prs, tag, sess, err) = r
+        model = (model or "?")[:28]
+        kv = f"{ck or '-'}/{cv or '-'}"[:9]
+        tag = tag or ""
+        # Abbreviate session_id (slot:cid:ts → cid12) for display.
+        sess_short = "-"
+        if sess:
+            parts = sess.split(":")
+            sess_short = parts[1] if len(parts) >= 2 else sess[:12]
+        if err:
+            print(f"  {rid:>4}  {ts:<20}  {slot:<10}  {model:<28}  "
+                  f"{'-':>6}  {'-':>4}  {kv:<9}  "
+                  f"{'-':>7}  {'-':>7}  {'-':>8}  {'-':>8}  "
+                  f"{sess_short:<14}  ERROR: {err}")
+            continue
+        pps_s = f"{pps:.1f}" if pps is not None else "-"
+        prs_s = f"{prs:.1f}" if prs is not None else "-"
+        print(f"  {rid:>4}  {ts:<20}  {slot:<10}  {model:<28}  "
+              f"{(ctx if ctx is not None else '-'):>6}  "
+              f"{(nmax if nmax is not None else '-'):>4}  "
+              f"{kv:<9}  "
+              f"{(pt if pt is not None else '-'):>7}  "
+              f"{(gt if gt is not None else '-'):>7}  "
+              f"{pps_s:>8}  {prs_s:>8}  "
+              f"{sess_short:<14}  {tag}")
+
+
+def cmd_show(args):
+    conn = db_connect()
+    cur = conn.execute("SELECT * FROM runs WHERE id = ?", (args.id,))
+    row = cur.fetchone()
+    if not row:
+        sys.exit(f"no run with id {args.id}")
+    cols = [d[0] for d in cur.description]
+    json_cols = {"cmd_argv", "flags", "overrides",
+                 "generation_settings", "props", "timings"}
+    for k, v in zip(cols, row):
+        if k in json_cols and v:
+            try:
+                v = json.dumps(json.loads(v), indent=2, sort_keys=True)
+            except Exception:
+                pass
+            print(f"{k}:")
+            for line in str(v).splitlines():
+                print(f"  {line}")
+        else:
+            print(f"{k}: {v}")
+
+
+def cmd_db_path(_args):
+    print(DB_PATH)
+
+
+# ── /metrics scraper (option 1: passive throughput logger) ────────────────────
+
+# Prometheus metric name → column name in metrics_samples. Anything in the
+# /metrics text not in this map still ends up in `metrics_raw` for forward
+# compatibility, but doesn't get a typed column.
+METRIC_COLUMNS = {
+    "llamacpp:prompt_tokens_total":         ("prompt_tokens_total", int),
+    "llamacpp:tokens_predicted_total":      ("predicted_tokens_total", int),
+    "llamacpp:prompt_seconds_total":        ("prompt_seconds_total", float),
+    "llamacpp:tokens_predicted_seconds_total": ("predicted_seconds_total", float),
+    "llamacpp:n_decode_total":              ("n_decode_total", int),
+    "llamacpp:prompt_tokens_seconds":       ("prompt_tokens_per_second", float),
+    "llamacpp:predicted_tokens_seconds":    ("predicted_tokens_per_second", float),
+    "llamacpp:kv_cache_usage_ratio":        ("kv_cache_usage_ratio", float),
+    "llamacpp:kv_cache_tokens":             ("kv_cache_tokens", int),
+    "llamacpp:requests_processing":         ("requests_processing", int),
+    "llamacpp:requests_deferred":           ("requests_deferred", int),
+    "llamacpp:n_busy_slots_per_decode":     ("n_busy_slots_per_decode", float),
+}
+
+
+def parse_prometheus(text):
+    """Return {metric_name: float_value}. Strips comments + labels."""
+    out = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        # name{labels} value  OR  name value
+        # Strip the label block if present (llamacpp doesn't use labels but
+        # be defensive).
+        if "{" in line:
+            head, _, rest = line.partition("{")
+            _, _, after = rest.partition("}")
+            line = head + after
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        name, value = parts[0], parts[-1]
+        try:
+            out[name] = float(value)
+        except ValueError:
+            continue
+    return out
+
+
+def fetch_metrics(host, port, timeout=5):
+    url = f"http://{host}:{port}/metrics"
+    with urllib.request.urlopen(url, timeout=timeout) as r:
+        return r.read().decode("utf-8")
+
+
+def _discover_session(slot, no_docker=False, no_systemd=False):
+    """Return (session_id, model_name) without re-running the bench parser."""
+    if not no_docker:
+        argv, sess = docker_inspect_cmd(slot)
+        if argv:
+            _, model_name, _, _ = parse_argv_to_flags(argv)
+            return sess, model_name
+    if not no_systemd:
+        argv, sess = systemd_show_cmd(slot)
+        if argv:
+            _, model_name, _, _ = parse_argv_to_flags(argv)
+            return sess, model_name
+    return None, None
+
+
+def cmd_watch(args):
+    if args.slot not in PORTS:
+        sys.exit(f"unknown slot {args.slot!r}; known: {', '.join(PORTS)}")
+    port = PORTS[args.slot]
+    host = args.host
+
+    # Discover session once; refresh only if we detect a restart (sample
+    # error then recovery is a cheap proxy for "container changed").
+    session_id, model_name = _discover_session(
+        args.slot, no_docker=args.no_docker, no_systemd=args.no_systemd)
+
+    conn = db_connect()
+    print(f"watching {args.slot} @ {host}:{port}  interval={args.interval}s  "
+          f"session={session_id or '?'}  (Ctrl+C to stop)")
+
+    samples_written = 0
+    last_was_error = False
+    consecutive_errors = 0
+    try:
+        while True:
+            ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            err = None
+            raw = ""
+            metrics = {}
+            try:
+                raw = fetch_metrics(host, port, timeout=args.timeout)
+                metrics = parse_prometheus(raw)
+            except Exception as e:
+                err = f"{type(e).__name__}: {e}"
+
+            # If we recovered from an error, the container may have been
+            # restarted — re-discover the session.
+            if err is None and last_was_error:
+                session_id, model_name = _discover_session(
+                    args.slot, no_docker=args.no_docker, no_systemd=args.no_systemd)
+            last_was_error = err is not None
+            consecutive_errors = consecutive_errors + 1 if err else 0
+
+            row = {
+                "ts": ts, "slot": args.slot, "port": port, "host": host,
+                "session_id": session_id, "model_name": model_name,
+                "metrics_raw": json.dumps(metrics, sort_keys=True) if metrics else None,
+                "error": err,
+            }
+            for metric_name, (col, conv) in METRIC_COLUMNS.items():
+                v = metrics.get(metric_name)
+                if v is None:
+                    row[col] = None
+                else:
+                    try:
+                        row[col] = conv(v)
+                    except (TypeError, ValueError):
+                        row[col] = None
+
+            cols = ", ".join(row.keys())
+            placeholders = ", ".join(["?"] * len(row))
+            with conn:
+                conn.execute(
+                    f"INSERT INTO metrics_samples ({cols}) VALUES ({placeholders})",
+                    list(row.values()),
+                )
+            samples_written += 1
+
+            if args.verbose:
+                if err:
+                    print(f"  {ts}  ERROR {err}")
+                else:
+                    pps = row.get("predicted_tokens_per_second")
+                    proc = row.get("requests_processing")
+                    pt = row.get("predicted_tokens_total")
+                    pps_s = f"{pps:.2f}" if isinstance(pps, (int, float)) else "-"
+                    print(f"  {ts}  predicted_total={pt}  "
+                          f"predicted_t/s={pps_s}  processing={proc}")
+
+            if args.samples and samples_written >= args.samples:
+                break
+            if args.max_errors and consecutive_errors >= args.max_errors:
+                if args.verbose:
+                    print(f"  giving up after {consecutive_errors} consecutive errors")
+                break
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        pass
+
+    print(f"\nwrote {samples_written} sample(s) to {DB_PATH}")
+
+
+def cmd_metrics(args):
+    """One-shot: fetch /metrics and print parsed values (no DB write)."""
+    if args.slot not in PORTS:
+        sys.exit(f"unknown slot {args.slot!r}; known: {', '.join(PORTS)}")
+    port = PORTS[args.slot]
+    raw = fetch_metrics(args.host, port, timeout=5)
+    metrics = parse_prometheus(raw)
+    if args.json:
+        print(json.dumps(metrics, indent=2, sort_keys=True))
+        return
+    for k in sorted(metrics):
+        print(f"  {k:<48}  {metrics[k]}")
+
+
+def cmd_samples(args):
+    conn = db_connect()
+    q = ("SELECT id, ts, slot, model_name, predicted_tokens_total, "
+         "predicted_tokens_per_second, requests_processing, "
+         "kv_cache_usage_ratio, session_id, error "
+         "FROM metrics_samples")
+    params, wheres = [], []
+    if args.slot:
+        wheres.append("slot = ?"); params.append(args.slot)
+    if args.session:
+        wheres.append("session_id = ?"); params.append(args.session)
+    if wheres:
+        q += " WHERE " + " AND ".join(wheres)
+    q += " ORDER BY id DESC LIMIT ?"
+    params.append(args.limit)
+    rows = conn.execute(q, params).fetchall()
+    if not rows:
+        print("(no samples)")
+        return
+    print(f"  {'id':>5}  {'ts':<20}  {'slot':<10}  {'model':<24}  "
+          f"{'pred tot':>10}  {'pred t/s':>9}  {'proc':>4}  {'kv%':>5}  sess")
+    for r in rows:
+        rid, ts, slot, model, pt, pps, proc, kv, sess, err = r
+        model = (model or "?")[:24]
+        sess_short = "-"
+        if sess:
+            parts = sess.split(":")
+            sess_short = parts[1] if len(parts) >= 2 else sess[:12]
+        if err:
+            print(f"  {rid:>5}  {ts:<20}  {slot:<10}  {model:<24}  "
+                  f"{'-':>10}  {'-':>9}  {'-':>4}  {'-':>5}  {sess_short}  ERROR: {err}")
+            continue
+        pps_s = f"{pps:.2f}" if pps is not None else "-"
+        kv_s = f"{kv*100:.1f}" if kv is not None else "-"
+        print(f"  {rid:>5}  {ts:<20}  {slot:<10}  {model:<24}  "
+              f"{(pt if pt is not None else '-'):>10}  "
+              f"{pps_s:>9}  "
+              f"{(proc if proc is not None else '-'):>4}  "
+              f"{kv_s:>5}  {sess_short}")
+
+
+def main():
+    p = argparse.ArgumentParser(prog="tok-log",
+                                description="Record llama-server token-speed benchmarks to SQLite.")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    b = sub.add_parser("bench", help="run a benchmark prompt against a slot and log it")
+    b.add_argument("slot", help=f"one of: {', '.join(PORTS)}")
+    b.add_argument("--prompt", help="prompt text (default: built-in spec-decoding prompt)")
+    b.add_argument("--n-predict", type=int, default=256, help="tokens to generate (default 256)")
+    b.add_argument("--host", default="127.0.0.1")
+    b.add_argument("--timeout", type=int, default=600, help="request timeout seconds")
+    b.add_argument("--tag", help="free-form label (e.g. 'mtp-n3', 'after-rebuild')")
+    b.add_argument("--no-docker", action="store_true",
+                   help="skip docker inspect when discovering effective argv")
+    b.add_argument("--no-systemd", action="store_true",
+                   help="skip systemctl when discovering effective argv")
+    b.set_defaults(func=cmd_bench)
+
+    l = sub.add_parser("list", help="show recent runs")
+    l.add_argument("--slot")
+    l.add_argument("--model", help="substring match on model_name")
+    l.add_argument("--session", help="exact match on session_id")
+    l.add_argument("--limit", type=int, default=20)
+    l.set_defaults(func=cmd_list)
+
+    s = sub.add_parser("show", help="dump a single run with full config")
+    s.add_argument("id", type=int)
+    s.set_defaults(func=cmd_show)
+
+    d = sub.add_parser("db-path", help="print the SQLite DB path")
+    d.set_defaults(func=cmd_db_path)
+
+    w = sub.add_parser("watch", help="passively log /metrics samples to SQLite")
+    w.add_argument("slot", help=f"one of: {', '.join(PORTS)}")
+    w.add_argument("--interval", type=int, default=10,
+                   help="poll interval seconds (default 10)")
+    w.add_argument("--samples", type=int,
+                   help="stop after N samples (default: run until Ctrl+C)")
+    w.add_argument("--host", default="127.0.0.1")
+    w.add_argument("--timeout", type=int, default=5)
+    w.add_argument("--verbose", action="store_true",
+                   help="print each sample as it's written")
+    w.add_argument("--max-errors", type=int, default=12,
+                   help="exit after N consecutive fetch failures (default 12 = ~2min "
+                        "at the default interval; 0 disables)")
+    w.add_argument("--no-docker", action="store_true")
+    w.add_argument("--no-systemd", action="store_true")
+    w.set_defaults(func=cmd_watch)
+
+    m = sub.add_parser("metrics", help="one-shot fetch + parse of /metrics (no DB write)")
+    m.add_argument("slot", help=f"one of: {', '.join(PORTS)}")
+    m.add_argument("--host", default="127.0.0.1")
+    m.add_argument("--json", action="store_true", help="output as JSON")
+    m.set_defaults(func=cmd_metrics)
+
+    sa = sub.add_parser("samples", help="show recent /metrics samples")
+    sa.add_argument("--slot")
+    sa.add_argument("--session", help="exact match on session_id")
+    sa.add_argument("--limit", type=int, default=20)
+    sa.set_defaults(func=cmd_samples)
+
+    args = p.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
