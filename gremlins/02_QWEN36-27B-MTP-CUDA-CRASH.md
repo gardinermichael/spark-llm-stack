@@ -212,6 +212,52 @@ only the highest-impact knobs.)
 
 ---
 
+## Troubleshooting log
+
+Chronological record of what was tried on this host. Read this before trying
+"obvious" mitigations — several of them were already proven insufficient.
+
+1. **First hypothesis: OOM.** Symptom (container exits, "no such container"
+   on `docker logs`) initially looked like an OOM-kill plus `--rm` tear-down.
+   Checked `journalctl --user -u earlyoom` and `journalctl -k --since '15 min
+   ago' | grep -iE 'oom|killed process'` — both empty, 96 GiB free in
+   `free -g` at the crash timestamp from `docker events`. **Ruled out.**
+
+2. **Second hypothesis: stale pre-merge MTP branch.** Service files point at
+   `%h/src/llama.cpp-mtp/build/bin/llama-server`, which predates the mainline
+   MTP merge (2026-05-16, PR #22673) and the [VRAM-leak fix](https://github.com/ggml-org/llama.cpp/issues/23395)
+   (2026-05-21). Rebuilt llama.cpp from mainline-master post-leak-fix, ran the
+   same model with the same flags. **Crashed identically at the same ~30k
+   boundary.** Ruled out — the May 21 leak fix is a different bug.
+
+3. **Third hypothesis: GB10-specific (aarch64 / SM 12.1).** Searched upstream
+   for matching reports. Found [vLLM #40756](https://github.com/vllm-project/vllm/issues/40756)
+   on discrete NVIDIA GPUs with the same model and same crash signature.
+   Cross-engine, cross-arch reproduction → **bug is in the Qwen3.6 MTP head,
+   not in llama.cpp or in GB10**. Ruled out.
+
+4. **Identified root cause via upstream:** [llama.cpp #23322](https://github.com/ggml-org/llama.cpp/issues/23322)
+   documents the Qwen3.6 SWA → KV invalidation → MTP draft desync chain, with
+   "acceptance saturates to 100% / scheduled = -1" as the leading indicator.
+   [llama.cpp #23264](https://github.com/ggml-org/llama.cpp/issues/23264)
+   documents the crash itself at the next checkpoint write. Confirmed our
+   pre-crash logs match both signatures.
+
+5. **Applied (2026-05-25): FP16 KV + `--spec-draft-n-max 2`.** Kept
+   `--kv-unified` and `--cache-reuse 1024` for now. Reasoning: FP16 KV is the
+   highest-evidence community workaround (multiple independent reports of full
+   stability); reducing draft horizon is the lowest-cost first lever.
+   Committed in `3b431a4`. **Verification pending on hardware.**
+
+6. **Next step if step 5 fails:** drop `--cache-reuse 1024` and `--kv-unified`
+   per #23322's analysis of KV-reuse-across-SWA-slide as the trigger.
+
+7. **Next step after that:** add `--ctx-checkpoints 8` (down from 128).
+
+8. **Last resort:** disable MTP entirely (remove `--spec-type draft-mtp` and
+   the three `--spec-draft-*` flags). The only guaranteed fix. Loses ~30%
+   throughput on coder.
+
 ## Lessons learned
 
 1. **Cross-engine reproduction is strong evidence of model-side bugs.** When

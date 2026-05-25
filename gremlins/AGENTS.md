@@ -96,6 +96,35 @@ factor                                category         severity
 - [Vendor doc / commit / thread](https://…)
 ```
 
+## Document the troubleshooting journey
+
+Reports should record **what was tried, in what order, and why each step was
+abandoned or kept** — not just the final fix. Future readers (human or agent)
+hitting the same gremlin need to know which dead ends to skip and which
+mitigations were already proven insufficient on this hardware.
+
+Add a `## Troubleshooting log` section (or extend `## Remediations`) with a
+chronological walk-through:
+
+```markdown
+## Troubleshooting log
+
+1. **First hypothesis: OOM.** Checked `journalctl -k` and `earlyoom` —
+   96 GiB free at crash. Ruled out.
+2. **Second hypothesis: stale llama.cpp build.** Rebuilt from mainline-master
+   (post the 2026-05-21 VRAM-leak fix). Crashed identically. Ruled out.
+3. **Tried: lowering `--ctx-checkpoints` to 8.** Crash still occurred at the
+   same ~30k boundary. Insufficient on its own.
+4. **Applied: FP16 KV + `--spec-draft-n-max 2`** (2026-05-25). Stable through
+   a 45k-context session. Current mitigation.
+5. **Next if this fails:** drop `--cache-reuse` and `--kv-unified`.
+```
+
+Include both the things that **didn't work** (with the evidence that ruled
+them out) and the things that **did**. A workaround that helped on a sibling
+report but didn't help here is still valuable to record — it tells the next
+reader the bug surface is different from the sibling's.
+
 ## Style rules
 
 - **Verbatim error messages.** Don't paraphrase. The error string is the
