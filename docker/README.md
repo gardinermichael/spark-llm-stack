@@ -479,6 +479,8 @@ tailscale ssh m@100.64.12.5      # raw tailnet IP also works
 docker-llm-switch status                    # slot table: port, memory bar, color-coded fit
 docker-llm-switch memory                    # live memory monitor (Ctrl+C to exit)
 docker-llm-switch <slot>                    # start <slot> (stops conflicting heavyweights only — see Coexistence policy below)
+docker-llm-switch <slot> stop               # stop only that slot, leave others running
+docker-llm-switch <slot> restart            # recreate that slot's container (picks up any config changes)
 docker-llm-switch off                       # stop everything
 docker-llm-switch panic                     # emergency: stop everything + drop caches
 
@@ -486,6 +488,28 @@ docker-llm-switch panic                     # emergency: stop everything + drop 
 docker-llm-switch boot-default architect    # only one slot ever has a restart policy
 docker-llm-switch boot-status               # show what starts at daemon boot
 docker-llm-switch boot-safe                 # clear all restart policies
+```
+
+### Per-slot lifecycle
+
+`<slot> stop` and `<slot> restart` operate on a single container without
+disturbing anything else that's running:
+
+- `stop` is the inverse of starting a slot — useful when you want to free
+  a slot's memory without taking down a sibling that's coexisting with it.
+- `restart` recreates the container (stop → remove → recreate) so it
+  picks up any `<slot> config` overrides you set since the slot was last
+  started. A `docker restart` would reuse the old CMD and ignore them.
+- An existing `--restart unless-stopped` policy is preserved across
+  `restart`, so a boot-default slot stays a boot-default slot.
+- Both skip the conflict / admission / cross-stack checks — they apply
+  only when a *new* slot enters the memory budget.
+
+Typical sequence for applying a runtime config change:
+
+```bash
+docker-llm-switch coder config -c 65536     # persist new context window
+docker-llm-switch coder restart             # apply it
 ```
 
 ### Coexistence policy
