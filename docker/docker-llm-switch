@@ -2100,6 +2100,10 @@ case "$CMD" in
     if [ $# -lt 2 ]; then
       exec "$tok_log" list
     fi
+    # `log web` is an ergonomic alias for `log serve`.
+    if [ "$2" = "web" ]; then
+      exec "$tok_log" serve "${@:3}"
+    fi
     exec "$tok_log" "${@:2}"
     ;;
   -h|--help|help)
@@ -2122,10 +2126,11 @@ Runtime:
                                     passively poll the slot's /metrics endpoint
                                     and append samples to SQLite. Runs until
                                     Ctrl+C (or --samples N).
-  docker-llm-switch log [list|samples|show|metrics|db-path …]
+  docker-llm-switch log [list|samples|show|metrics|serve|db-path …]
                                     inspect the token-speed log (default: \`list\`).
                                     e.g. \`log list --slot coder\`, \`log show 42\`,
-                                    \`log samples --slot coder --limit 50\`.
+                                    \`log samples --slot coder --limit 50\`,
+                                    \`log serve\` to launch the web UI at :8765.
   docker-llm-switch off             stop everything
   docker-llm-switch status          color-coded slot table with port + memory bars
   docker-llm-switch health          verify OOM failsafe, CLI tools, and installed-file drift

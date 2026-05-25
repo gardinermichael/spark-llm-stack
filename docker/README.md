@@ -630,6 +630,19 @@ docker-llm-switch log                              # recent bench runs (default:
 docker-llm-switch log samples --slot coder         # recent /metrics samples
 docker-llm-switch log show 42                      # full config + JSON blobs for one bench
 docker-llm-switch log db-path                      # path to the SQLite file
+docker-llm-switch log web                          # launch the dashboard at http://127.0.0.1:8765
+```
+
+**Web dashboard.** `log web` (alias of `log serve`) starts a stdlib HTTP
+server with a single-page UI: filters (slot / model / session / date range),
+a benches table (click any row for the full effective argv and JSON blobs),
+a throughput timeline (predicted tokens/sec over time, colored by session),
+a bench comparison bar chart (group by tag, model, `--spec-draft-n-max`, or
+the full config tuple), and a KV-cache usage chart per session. Bind to
+`0.0.0.0` to reach it over Tailscale:
+
+```bash
+docker-llm-switch log web --host 0.0.0.0 --port 8765
 ```
 
 **Run a controlled benchmark** (captures the full effective argv — including
