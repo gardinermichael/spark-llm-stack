@@ -94,6 +94,17 @@ declare -A MEMSOFT=(
   [coder]=70g [architect]=70g [gemma]=70g [vision]=15g [gptoss]=30g
   [imagine]=12g [comfyui]=30g
 )
+# Weight class — mirrors the `heavyweight` column in systemd/harden-llm-stack.sh
+# (heavyweights are the LLM slots that go into the Conflicts= pool there).
+# Heavyweight pairs are mutually exclusive at runtime; lightweights can
+# coexist with each other and with one heavyweight subject to the admission
+# gate. See POSTMORTEM: two heavyweights together (~160GiB) caused the OOM
+# brick loop; lightweight pairs (vision 20G + imagine 16G + comfyui 40G) all
+# fit comfortably on a 121 GiB unified pool.
+declare -A HEAVY=(
+  [coder]=1 [architect]=1 [gemma]=1 [gptoss]=1
+  [vision]=0 [imagine]=0 [comfyui]=0
+)
 # Per-slot image. Llama slots all share one image (different CMD per slot);
 # imagine and comfyui get their own images built from docker/sd-server and
 # docker/comfyui respectively. Override individually via SPARK_IMAGE_<slot>.
@@ -363,6 +374,32 @@ stop_all_except() {
     [ "$name" = "$keep" ] && continue
     if [ "$(ctr_state "$name")" = "running" ]; then
       echo "  stopping $slot..."
+      docker stop "$name" >/dev/null
+    fi
+  done
+}
+
+# Weight-class-aware intra-stack mutex. Stops only slots that conflict with
+# the target's weight class — heavyweight pairs are exclusive (POSTMORTEM
+# rationale), every other pairing is allowed and falls through to the
+# admission gate. Used on the runtime `<slot>` path; boot-default and `off`
+# still call stop_all_except for full eviction.
+class_conflict() {
+  local target="$1" other="$2"
+  # Conflict iff both are heavyweight.
+  [ "${HEAVY[$target]:-0}" = "1" ] && [ "${HEAVY[$other]:-0}" = "1" ]
+}
+
+stop_conflicts() {
+  local target_slot="$1"
+  local target_name; target_name=$(ctr_name "$target_slot")
+  for slot in "${SLOTS[@]}"; do
+    [ "$slot" = "$target_slot" ] && continue
+    local name; name=$(ctr_name "$slot")
+    [ "$name" = "$target_name" ] && continue
+    [ "$(ctr_state "$name")" = "running" ] || continue
+    if class_conflict "$target_slot" "$slot"; then
+      echo "  stopping $slot (heavyweight conflict)..."
       docker stop "$name" >/dev/null
     fi
   done
@@ -1057,8 +1094,10 @@ if is_slot "$CMD"; then
   # Layer 1 of the cross-stack failsafe: shared mutex + admission gate.
   spark_acquire_lock || exit 1
 
-  # Intra-stack: stop other spark-llm-* slots (existing behaviour).
-  stop_all_except "$target"
+  # Intra-stack: stop only weight-class conflicts. Heavyweight pairs are
+  # exclusive (POSTMORTEM); lightweights coexist with each other and with
+  # one heavyweight, subject to the admission gate below.
+  stop_conflicts "$CMD"
 
   # Flush BEFORE admission so the check sees post-flush MemAvailable —
   # mirrors autoresearch-switch, keeps cross-stack eviction policy
