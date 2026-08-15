@@ -4,5 +4,10 @@ work/
 secrets/
 .DS_Store
 
+# Operator-owned environment for the per-slot Komodo Stacks. Holds
+# HUGGING_FACE_HUB_TOKEN. Only docker/.env.example is tracked, and the Komodo
+# Stack's `environment` field must stay empty so Komodo never overwrites this.
+docker/.env
+
 .claude/settings.local.json
 .claude/worktrees/

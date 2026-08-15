@@ -1,0 +1,173 @@
+# spark-coder — Qwen3.6-27B MTP, the fast coding slot. HEAVYWEIGHT.
+#
+# This file is the reference for the other six compose.<slot>.yaml files; the
+# rationale below is not repeated in them. It is a faithful translation of
+# docker_run_slot() at docker/docker-llm-switch:486-531 plus CMD_coder at
+# :150-166, with four deliberate departures, each marked DEPARTURE below.
+#
+# Deployed by Komodo as Stack `spark-coder` against Server `spark`. Not by
+# docker-llm-switch — that script remains the interactive path and the two
+# must not both own a slot at the same time.
+#
+# ── the label contract ───────────────────────────────────────────────────────
+# `spark.exclusive=true` is load-bearing, not decoration. /usr/local/lib/
+# spark-mem.sh:111-120 enumerates the exclusive set SOLELY by that label, and
+# earlyoom's -N hook calls spark-panic, which stops exactly that set. A
+# container without the label is invisible to the failsafe on a host where
+# cgroup memory limits provably do not bind CUDA allocations. Do not remove it.
+#
+# `spark.weight` is new here and is read by scripts/check-gpu-slot.sh to decide
+# what conflicts with what. docker-llm-switch does not set it; the guard treats
+# an unlabelled exclusive container as heavy, which is the safe direction.
+
+name: spark-coder
+
+services:
+  coder:
+    image: spark-llm-stack
+    container_name: spark-llm-coder
+
+    # No `build:` section, deliberately. Five slots share this one image, so a
+    # build here would rebuild identical layers five times. The image is built
+    # out of band by `docker compose -f docker/docker-compose.yml build`, and
+    # scripts/check-image.sh fails the deploy early if it is missing.
+
+    # DEPARTURE 1 — was `--network=host`, which put `--host 0.0.0.0` on every
+    # host interface including the tailnet. The process still binds 0.0.0.0,
+    # but now only inside its own network namespace; the host publishes to
+    # loopback alone. Reached from elsewhere via host-owned Tailscale Serve.
+    # scripts/check-bind.sh enforces this and quantifies over every port.
+    ports:
+      - "127.0.0.1:8152:8152"
+
+    gpus: all
+
+    # Honest about what these do: on GB10 they are documentation. CUDA
+    # allocates through /dev/nvidia-uvm and bypasses cgroup reclaim, so
+    # mem_limit does NOT stop this container exhausting the shared 128 GB
+    # pool. They are kept because check-gpu-slot.sh reads mem_limit as the
+    # slot's projected footprint, and because they still bound host-side
+    # allocations. Real enforcement is earlyoom + spark-panic.
+    mem_limit: 80g
+    memswap_limit: 80g        # equal to mem_limit, i.e. swap disabled
+    mem_reservation: 70g
+    oom_score_adj: 200
+    shm_size: 1g
+    ulimits:
+      memlock: -1
+
+    labels:
+      spark.exclusive: "true"
+      spark.stack: "llm"
+      spark.slot: "coder"
+      spark.weight: "heavy"
+
+    # DEPARTURE 2 — was `--rm`. Compose has no auto_remove, but the half that
+    # mattered is preserved: dockerd must never resurrect a heavyweight that
+    # was OOM-killed. That is the Docker analogue of OOMPolicy=stop from the
+    # POSTMORTEM hardening. DestroyStack reaps the stopped container.
+    restart: "no"
+
+    environment:
+      HUGGING_FACE_HUB_TOKEN: ${HUGGING_FACE_HUB_TOKEN:-}
+
+    volumes:
+      - type: bind
+        source: ${MODELS_DIR:?set MODELS_DIR in docker/.env}
+        target: /models
+
+    # DEPARTURE 3 — replaces wait_ready/probe_ready at docker-llm-switch:444-482.
+    # The llama image ships NEITHER curl NOR wget, only python3 (verified
+    # against spark-llm-stack:latest). A curl-based healthcheck would fail on
+    # every probe and mark the slot permanently unhealthy while it served
+    # traffic perfectly well. urlopen raises on any non-2xx, so a 503 during
+    # weight loading reads as unhealthy, which is correct.
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8152/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      # probe_ready allows 300s for the llama slots. Matching it keeps the two
+      # paths agreeing on what "slow to start" means.
+      start_period: 300s
+
+    # Verbatim from CMD_coder, docker/docker-llm-switch:150-166.
+    #
+    # DEPARTURE 4 — _apply_overrides (:342-363) is gone. It spliced values from
+    # ~/.config/docker-llm-switch/overrides/<slot> into this array at container
+    # create time; compose has no equivalent. That directory is currently
+    # EMPTY, so nothing is lost today, and this array is now the single source
+    # of truth for the slot.
+    #
+    # FP16 KV cache is specific to this slot and is a crash mitigation, not a
+    # preference: Qwen3.6-27B + MTP hits a CUDA illegal-memory-access past
+    # ~30k ctx. See gremlins/02_QWEN36-27B-MTP-CUDA-CRASH.md for the full
+    # walk-back ladder before changing any of it.
+    command:
+      - -m
+      - /models/Qwen3.6-27B-UD-Q4_K_XL.gguf
+      - --alias
+      - qwen3.6-27b-coder
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8152"
+      - -ngl
+      - "999"
+      - -fa
+      - "on"
+      - -c
+      - "131072"
+      - --cache-type-k
+      - f16
+      - --cache-type-v
+      - f16
+      - --kv-unified
+      - --cache-ram
+      - "49152"
+      - --cache-idle-slots
+      - --ctx-checkpoints
+      - "128"
+      - --cache-reuse
+      - "1024"
+      - -b
+      - "32768"
+      - -ub
+      - "8192"
+      - --parallel
+      - "1"
+      - --threads
+      - "16"
+      - --threads-batch
+      - "24"
+      - --threads-http
+      - "4"
+      - --prio
+      - "3"
+      - --poll
+      - "100"
+      - --spec-type
+      - draft-mtp
+      - --spec-draft-n-max
+      - "3"
+      - --spec-draft-n-min
+      - "1"
+      - --spec-draft-p-min
+      - "0.75"
+      - --reasoning
+      - "off"
+      - --jinja
+      - --temp
+      - "0.6"
+      - --top-k
+      - "20"
+      - --top-p
+      - "0.95"
+      - --min-p
+      - "0.0"
+      - --presence-penalty
+      - "0.0"
+      - --keep
+      - "-1"
+      - --metrics
+      - --slots
