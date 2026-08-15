@@ -1,0 +1,117 @@
+# spark-architect — Qwen3.6-35B-A3B MoE, the deep-reasoning slot. HEAVYWEIGHT.
+# See docker/compose.coder.yaml for the rationale behind every field here.
+#
+# The model file was absent from MODELS_DIR until 2026-08-14: it lived under
+# ~/llm/unsloth, which no container mounts, so this slot started, failed to
+# open -m, and had its corpse removed by --rm. It is now a HARD LINK inside
+# MODELS_DIR. A symlink does not work — it would point at a host path that
+# does not exist inside the container and dangle silently.
+
+name: spark-architect
+
+services:
+  architect:
+    image: spark-llm-stack
+    container_name: spark-llm-architect
+
+    ports:
+      - "127.0.0.1:8154:8154"
+
+    gpus: all
+
+    mem_limit: 80g
+    memswap_limit: 80g
+    mem_reservation: 70g
+    oom_score_adj: 200
+    shm_size: 1g
+    ulimits:
+      memlock: -1
+
+    labels:
+      spark.exclusive: "true"
+      spark.stack: "llm"
+      spark.slot: "architect"
+      spark.weight: "heavy"
+
+    restart: "no"
+
+    environment:
+      HUGGING_FACE_HUB_TOKEN: ${HUGGING_FACE_HUB_TOKEN:-}
+
+    volumes:
+      - type: bind
+        source: ${MODELS_DIR:?set MODELS_DIR in docker/.env}
+        target: /models
+
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8154/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 300s
+
+    # Verbatim from CMD_architect, docker/docker-llm-switch:168-183.
+    command:
+      - -m
+      - /models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf
+      - --alias
+      - qwen3.6-35b-architect
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8154"
+      - -ngl
+      - "999"
+      - -fa
+      - "on"
+      - -c
+      - "131072"
+      - --cache-type-k
+      - q8_0
+      - --cache-type-v
+      - q8_0
+      - --kv-unified
+      - --cache-ram
+      - "49152"
+      - --cache-idle-slots
+      - --ctx-checkpoints
+      - "64"
+      - --cache-reuse
+      - "1024"
+      - -b
+      - "16384"
+      - -ub
+      - "4096"
+      - --parallel
+      - "1"
+      - --threads
+      - "16"
+      - --threads-batch
+      - "24"
+      - --threads-http
+      - "4"
+      - --prio
+      - "2"
+      - --poll
+      - "50"
+      - --reasoning
+      - "on"
+      - --reasoning-budget
+      - "4000"
+      - --reasoning-format
+      - deepseek
+      - --jinja
+      - --temp
+      - "1.0"
+      - --top-k
+      - "20"
+      - --top-p
+      - "0.95"
+      - --min-p
+      - "0.0"
+      - --presence-penalty
+      - "0.5"
+      - --keep
+      - "-1"
+      - --metrics
+      - --slots

@@ -1,0 +1,108 @@
+# spark-vision — Gemma-4-E4B, fast vision and audio input. LIGHTWEIGHT.
+# See docker/compose.coder.yaml for the rationale behind every field here.
+#
+# Lightweight slots coexist: vision 20G + imagine 16G + comfyui 40G all fit the
+# 121 GiB pool alongside one heavyweight, subject to the admission gate. That
+# is why this carries spark.weight=light and needs no activation Procedure.
+
+name: spark-vision
+
+services:
+  vision:
+    image: spark-llm-stack
+    container_name: spark-llm-vision
+
+    ports:
+      - "127.0.0.1:8155:8155"
+
+    gpus: all
+
+    mem_limit: 20g
+    memswap_limit: 20g
+    mem_reservation: 15g
+    oom_score_adj: 200
+    shm_size: 1g
+    ulimits:
+      memlock: -1
+
+    labels:
+      spark.exclusive: "true"
+      spark.stack: "llm"
+      spark.slot: "vision"
+      spark.weight: "light"
+
+    restart: "no"
+
+    environment:
+      HUGGING_FACE_HUB_TOKEN: ${HUGGING_FACE_HUB_TOKEN:-}
+
+    volumes:
+      - type: bind
+        source: ${MODELS_DIR:?set MODELS_DIR in docker/.env}
+        target: /models
+
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8155/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 300s
+
+    # Verbatim from CMD_vision, docker/docker-llm-switch:202-215. Note this
+    # slot deliberately has NO --cache-idle-slots and NO --ctx-checkpoints,
+    # and a much smaller --cache-ram; it is tuned to stay small.
+    command:
+      - -m
+      - /models/gemma-4-E4B-it-UD-Q4_K_XL.gguf
+      - --alias
+      - gemma4-vision
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8155"
+      - -ngl
+      - "999"
+      - -fa
+      - "on"
+      - -c
+      - "131072"
+      - --cache-type-k
+      - q8_0
+      - --cache-type-v
+      - q8_0
+      - --kv-unified
+      - --cache-ram
+      - "8192"
+      - --cache-reuse
+      - "256"
+      - -b
+      - "8192"
+      - -ub
+      - "2048"
+      - --parallel
+      - "1"
+      - --threads
+      - "16"
+      - --threads-batch
+      - "16"
+      - --threads-http
+      - "4"
+      - --prio
+      - "2"
+      - --poll
+      - "50"
+      - --reasoning
+      - "off"
+      - --jinja
+      - --temp
+      - "1.0"
+      - --top-k
+      - "64"
+      - --top-p
+      - "0.95"
+      - --min-p
+      - "0.0"
+      - --keep
+      - "-1"
+      - --metrics
+      - --slots

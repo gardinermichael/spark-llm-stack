@@ -1,0 +1,86 @@
+# spark-imagine — FLUX.2-klein-4B via sd-server. LIGHTWEIGHT.
+# See docker/compose.coder.yaml for the rationale behind every field here.
+
+name: spark-imagine
+
+services:
+  imagine:
+    image: spark-llm-imagine
+    container_name: spark-llm-imagine
+
+    ports:
+      - "127.0.0.1:8160:8160"
+
+    gpus: all
+
+    mem_limit: 16g
+    memswap_limit: 16g
+    mem_reservation: 12g
+    oom_score_adj: 200
+    shm_size: 1g
+    ulimits:
+      memlock: -1
+
+    labels:
+      spark.exclusive: "true"
+      spark.stack: "llm"
+      spark.slot: "imagine"
+      spark.weight: "light"
+
+    restart: "no"
+
+    environment:
+      HUGGING_FACE_HUB_TOKEN: ${HUGGING_FACE_HUB_TOKEN:-}
+
+    volumes:
+      - type: bind
+        source: ${MODELS_DIR:?set MODELS_DIR in docker/.env}
+        target: /models
+
+    # This image ships no curl, no wget and no python3 — verified against
+    # spark-llm-imagine:latest. It does have bash, so this is a TCP-accept
+    # probe via /dev/tcp rather than an HTTP readiness check.
+    #
+    # Stated plainly because it is weaker than the llama probes: it proves the
+    # listener is up, not that the model loaded. An HTTP probe is not available
+    # without adding a tool to the image, and probe_ready's own HTTP path
+    # (docker-llm-switch:450-454) documents that /sdcpp/v1/capabilities returns
+    # 500 inside Docker anyway — it reads /proc/1/map_files, which yama ptrace
+    # restrictions and the dropped CAP_SYS_PTRACE block in a container.
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8160"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 300s
+
+    # Verbatim from CMD_imagine, docker/docker-llm-switch:234-250.
+    #
+    # The four sampling flags are NOT preferences. FLUX.2-klein is a 4-step
+    # distilled model, and /v1/images/generations exposes no per-request
+    # overrides, so they have to be server-side defaults. Note these differ
+    # from the image's own baked CMD, which uses --threads 8 and omits them.
+    command:
+      - --diffusion-model
+      - /models/flux2-klein/flux-2-klein-4b.safetensors
+      - --llm
+      - /models/flux2-klein/text_encoder/qwen_3_4b.safetensors
+      - --vae
+      - /models/flux2-klein/ae.safetensors
+      - --listen-ip
+      - 0.0.0.0
+      - --listen-port
+      - "8160"
+      - --diffusion-fa
+      - --type
+      - f16
+      - --threads
+      - "16"
+      - --steps
+      - "4"
+      - --sampling-method
+      - euler
+      - --cfg-scale
+      - "1.0"
+      - --guidance
+      - "3.5"

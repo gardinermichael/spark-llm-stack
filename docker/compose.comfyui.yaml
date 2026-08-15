@@ -1,0 +1,82 @@
+# spark-comfyui — ComfyUI diffusion UI and workflows. LIGHTWEIGHT.
+# See docker/compose.coder.yaml for the rationale behind every field here.
+#
+# The first stack to deploy on this node. It is the safest choice: not a
+# heavyweight, so a mistake cannot brick the host, and its image is the only
+# one of the three that already carries a working HEALTHCHECK.
+#
+# Three host directories are mounted read-write for state that must survive a
+# container recreate. docker_run_slot creates them with `mkdir -p` before
+# starting (docker-llm-switch:504); scripts/check-gpu-slot.sh reproduces that
+# generically and chowns to the run directory's owner, because the daemon
+# would otherwise create them root-owned and lock the operator out of their
+# own output directory.
+
+name: spark-comfyui
+
+services:
+  comfyui:
+    image: spark-llm-comfyui
+    container_name: spark-llm-comfyui
+
+    ports:
+      - "127.0.0.1:8188:8188"
+
+    gpus: all
+
+    mem_limit: 40g
+    memswap_limit: 40g
+    mem_reservation: 30g
+    oom_score_adj: 200
+    shm_size: 1g
+    ulimits:
+      memlock: -1
+
+    labels:
+      spark.exclusive: "true"
+      spark.stack: "llm"
+      spark.slot: "comfyui"
+      spark.weight: "light"
+
+    restart: "no"
+
+    environment:
+      HUGGING_FACE_HUB_TOKEN: ${HUGGING_FACE_HUB_TOKEN:-}
+
+    volumes:
+      - type: bind
+        source: ${MODELS_DIR:?set MODELS_DIR in docker/.env}
+        target: /opt/ComfyUI/models
+      - type: bind
+        source: ${COMFY_DIR:?set COMFY_DIR in docker/.env}/custom_nodes
+        target: /opt/ComfyUI/custom_nodes
+      - type: bind
+        source: ${COMFY_DIR:?set COMFY_DIR in docker/.env}/output
+        target: /opt/ComfyUI/output
+      - type: bind
+        source: ${COMFY_DIR:?set COMFY_DIR in docker/.env}/user
+        target: /opt/ComfyUI/user
+
+    # Restated rather than inherited from the image. The image's baked
+    # HEALTHCHECK is identical in substance, but an inherited healthcheck is
+    # invisible in this file, and the start_period below is deliberately
+    # longer than the image's 120s: ComfyUI-Manager syncs its registry on
+    # boot, and probe_ready allows 600s for this slot specifically
+    # (docker-llm-switch:471-473).
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8188/system_stats || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 600s
+
+    # Verbatim from CMD_comfyui, docker/docker-llm-switch:254-259. The two
+    # unified-memory safety flags are explained in docker/comfyui/Dockerfile.
+    command:
+      - --listen
+      - 0.0.0.0
+      - --port
+      - "8188"
+      - --disable-pinned-memory
+      - --reserve-vram
+      - "8.0"
